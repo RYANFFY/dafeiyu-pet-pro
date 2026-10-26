@@ -51,7 +51,8 @@ W_MIN, W_MAX = 200, 340  # 宽度范围（跟着鱼**本体**走；200 是"鱼�
 H_MIN, H_MAX = 240, 420  # 高度范围
 W_RATIO, H_RATIO = 1.45, 1.35   # 相对鱼的宽 / 高
 MARGIN = 10              # 四周留白：画"假阴影"和尖角用，窗口本身是透明的
-GAP = 2                  # 和**鱼**之间的空隙（不是和窗口）
+GAP = 2                  # 和**鱼**之间的空隙（兜底下限；实际按鱼身宽算，见 GAP_RATIO）
+GAP_RATIO = 0.03         # 空隙 = 鱼身宽 × 3%（主人 2026-10-27：任何大小都要**恒定比例**的距离）
 SLIDE_MS = 170           # 滑出 / 滑回时长
 FOLLOW_MS = 60           # 跟随时重新对位的间隔
 FOLLOW_EPS = 2           # 位置差这么点就别动了（省得每 60ms 都 move 一次）
@@ -123,8 +124,40 @@ class _Bubble(QLabel):
                 f" border-radius: 10px; padding: {pad}; }}")
 
 
+def _fit_chipbox(box, btns, avail):
+    """把一批按钮塞进 `avail` 宽：放得下按自然宽，放不下换两行，再不行才省略。
+
+    ⚠️ 自然宽一律用 `sizeHint()`（样式内边距算在里面）。早先用
+    `fontMetrics().horizontalAdvance() + 20` 估，估少了按钮就被定窄、**字被裁掉**
+    （主人 2026-10-27：「输出文件打开桌面看成果文字显示不全」，当时只剩半个字）。
+    """
+    btns = [b for b in (btns or []) if b is not None]
+    if not btns:
+        return
+    avail = max(80, int(avail))
+    nat = []
+    for b in btns:
+        b.setMaximumWidth(16777215)
+        b.setText(b._dfy_text)
+        b.setToolTip(b._dfy_text)          # 真截了也能看全文
+        nat.append(max(44, b.sizeHint().width()))
+    if sum(nat) + 6 * (len(btns) - 1) <= avail:
+        for b, w in zip(btns, nat):
+            b.setFixedWidth(w)
+        box.relayout(btns, len(btns))
+        return
+    per_row = max(1, (len(btns) + 1) // 2)     # 一行放不下 → 两行
+    per = max(46, (avail - 6 * (per_row - 1)) // per_row)
+    for b in btns:
+        b.setFixedWidth(per)
+        fm = b.fontMetrics()
+        b.setText(fm.elidedText(b._dfy_text, Qt.TextElideMode.ElideRight,
+                                max(24, per - 16)))
+    box.relayout(btns, per_row)
+
+
 class _ChipBox(QWidget):
-    """那排 chip 的容器：**宽度不许影响整块板子的宽度**。
+    """那排 chip 的容器：**宽度不许影响整块板子的宽度**，放不下时自己换成两行。
 
     为什么需要它：QWidget 的最小宽度来自布局，布局的最小宽度来自每个 QPushButton 的
     minimumSizeHint（含文字宽度）。所以只要这排按钮存在，板子的最小宽度就被顶到
@@ -135,6 +168,13 @@ class _ChipBox(QWidget):
     主人 2026-10-27 报的「交给谁全部消失」就是这个）。按钮的宽度由 `_fit_chips()` 明确给。
     """
 
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.cols = QVBoxLayout(self)
+        self.cols.setContentsMargins(0, 0, 0, 0)
+        self.cols.setSpacing(4)
+        self.row_layouts = []
+
     def minimumSizeHint(self):          # noqa: N802
         s = super().minimumSizeHint()
         return QSize(0, s.height())
@@ -142,6 +182,27 @@ class _ChipBox(QWidget):
     def sizeHint(self):                 # noqa: N802
         s = super().sizeHint()
         return QSize(0, s.height())
+
+    def relayout(self, buttons, per_row):
+        """把按钮重新分到若干行（按钮本身不删，只是从旧布局里摘下来）。"""
+        while self.cols.count():
+            it = self.cols.takeAt(0)
+            lay = it.layout() if it is not None else None
+            if lay is not None:
+                while lay.count():
+                    lay.takeAt(0)
+                lay.deleteLater()
+        self.row_layouts = []
+        n = max(1, int(per_row or len(buttons) or 1))
+        for i in range(0, len(buttons), n):
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(6)
+            for b in buttons[i:i + n]:
+                row.addWidget(b)
+            row.addStretch(1)
+            self.cols.addLayout(row)
+            self.row_layouts.append(row)
 
 
 class FlyoutWindow(QWidget):
@@ -269,9 +330,7 @@ class FlyoutWindow(QWidget):
         # ⚠️ 2026-10-27 主人：「派活界面加载的文案信息会让窗口越来越长会挡道桌宠」。
         # 真凶是这排 chip 的 sizeHint 会把整块板子的**最小宽度**顶上去（实测 260 → 336）。
         # 用 `_ChipBox` 把它的宽度贡献清零，按钮宽度由 `_fit_chips()` 明确给。
-        self.actions_row = QHBoxLayout(self.actions_box)
-        self.actions_row.setContentsMargins(0, 0, 0, 0)
-        self.actions_row.setSpacing(6)
+        self._chip_btns = []                 # 顺序即显示顺序（跨行也在这一份里）
         self.actions_box.hide()
         lay.addWidget(self.actions_box)
 
@@ -669,12 +728,8 @@ class FlyoutWindow(QWidget):
             self._clear_quick_actions()
             self.actions_box.hide()
             return
-        old = [self.actions_row.itemAt(i).widget()
-               for i in range(self.actions_row.count())
-               if self.actions_row.itemAt(i) is not None]
-        old = [w for w in old if w is not None]
-        if len(old) == len(entries):
-            for b, (text, cb, on) in zip(old, entries):
+        if len(self._chip_btns) == len(entries):
+            for b, (text, cb, on) in zip(self._chip_btns, entries):
                 b._dfy_text = text
                 b.setText(text)
                 b.setObjectName("chipOn" if on else "chip")
@@ -698,8 +753,7 @@ class FlyoutWindow(QWidget):
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             b._dfy_cb = cb
             b.clicked.connect(cb)
-            self.actions_row.addWidget(b)
-        self.actions_row.addStretch(1)
+            self._chip_btns.append(b)
         self.actions_box.show()
         self.apply_theme()          # 新按钮要跟着当前主题上色
         self._fit_chips()
@@ -707,49 +761,45 @@ class FlyoutWindow(QWidget):
         if self.isVisible() and self._anim is None:
             self._target = self._place()[0]
 
-    def _fit_chips(self):
-        """按当前宽度把这排 chip 收窄 / 截字，绝不让它们把窗口顶宽。
+    @property
+    def actions_row(self):
+        """第一行（测试和老代码在用）。多行时用 `chip_buttons()` 取全部。"""
+        rows = getattr(self.actions_box, "row_layouts", [])
+        return rows[0] if rows else None
 
-        主人 2026-10-27：「文案信息会让窗口越来越长会挡道桌宠」。原来这排按钮的
-        sizeHint 会一路把最小宽度顶到 336（鱼才 155 宽），布局锁住之后 `_place()`
-        的 resize 就压不回来 —— 板子比鱼还宽，贴上去就把鱼盖住了。
-        现在：宽度不参与布局（Ignored）+ 每颗按可用宽度均分 + 文字省略。
+    def chip_buttons(self):
+        """这排 chip 的全部按钮（跨行，按显示顺序）。"""
+        return [b for b in getattr(self, "_chip_btns", []) if b is not None]
+
+    def _fit_chips(self):
+        """按当前宽度安排这排 chip：**先按真实宽度试一行，放不下就换两行**。
+
+        主人 2026-10-27：「交给谁的ui选项仍然没有，而且输出文件打开桌面看成果文字显示不全」。
+        两个原因：
+          1. 原来拿 `fontMetrics().horizontalAdvance() + 20` 估宽度 —— **没算样式内边距**，
+             估少了就把按钮定成 56px，字被裁掉（"Codex" 只剩半个，看着像没有）；
+          2. 板子窄（最小 200）时三颗本来就挤不下，硬挤只能裁字。
+        现在：自然宽一律用 `sizeHint()`（样式内边距算在里面）；一行放不下就分成两行，
+        每行均分宽度，实在还不够才省略（tooltip 看全文）。
         """
-        btns = []
-        for i in range(self.actions_row.count()):
-            it = self.actions_row.itemAt(i)
-            w = it.widget() if it is not None else None
-            if w is not None and hasattr(w, "_dfy_text"):
-                btns.append(w)
+        btns = self.chip_buttons()
         if not btns:
             return
-        gap = 6 * (len(btns) - 1)
-        avail = max(80, self.width() - 2 * MARGIN - 10 - gap)
-        # 先量"原样放得下吗"：放得下就一个字都不截（多数情况就是这条）
-        hints = [b.fontMetrics().horizontalAdvance(b._dfy_text) + 20 for b in btns]
-        for b in btns:
-            b.setToolTip(b._dfy_text)        # 截了就靠 tooltip 看全文
-        if sum(hints) <= avail:
-            for b, h in zip(btns, hints):
-                b.setFixedWidth(max(40, h))
-                b.setText(b._dfy_text)
-            return
-        per = max(46, avail // len(btns))
-        for b in btns:
-            b.setFixedWidth(per)
-            fm = b.fontMetrics()
-            b.setText(fm.elidedText(b._dfy_text, Qt.TextElideMode.ElideRight,
-                                    max(24, per - 14)))
+        _fit_chipbox(self.actions_box, btns, self.width() - 2 * MARGIN - 12)
 
     def _clear_quick_actions(self):
         """清空那排 chip。⚠️ `_dfy_cb` 要一起清，否则复用时会去 disconnect 死对象。"""
-        while self.actions_row.count():
-            item = self.actions_row.takeAt(0)
-            w = item.widget() if item is not None else None
-            if w is not None:
-                w._dfy_cb = None
-                w.setParent(None)
-                w.deleteLater()
+        for b in getattr(self, "_chip_btns", []):
+            if b is None:
+                continue
+            b._dfy_cb = None
+            b.setParent(None)
+            b.deleteLater()
+        self._chip_btns = []
+        try:
+            self.actions_box.relayout([], 1)
+        except (RuntimeError, AttributeError):
+            pass
 
     def set_clear_handler(self, fn):
         """挂上「清空对话」键（fn 负责清数据，界面上的气泡这里自己清）。"""
@@ -833,18 +883,21 @@ class FlyoutWindow(QWidget):
         v.setSpacing(4)
         b = _Bubble(role, text, box)
         v.addWidget(b, 0, Qt.AlignmentFlag.AlignLeft)
-        row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(6)
+        # 按钮也放进 _ChipBox：板子窄的时候自动换成两行，字不会被裁
+        # （主人 2026-10-27：「输出文件打开桌面看成果文字显示不全」）。
+        chipbox = _ChipBox(box)
+        btns = []
         for label, cb in (actions or []):
-            btn = QPushButton(str(label), box)
+            btn = QPushButton(str(label), chipbox)
             btn.setObjectName("chip")
+            btn._dfy_text = str(label)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn._dfy_cb = cb          # 留住引用：否则 Python 回收后点了就是 RuntimeError
             btn.clicked.connect(cb)
-            row.addWidget(btn)
-        row.addStretch(1)
-        v.addLayout(row)
+            btns.append(btn)
+        chipbox._dfy_btns = btns
+        v.addWidget(chipbox)
+        _fit_chipbox(chipbox, btns, max(120, self.width() - 2 * MARGIN - 20))
         self.msgs.insertWidget(self.msgs.count() - 1, box)
         # ⚠️ 宽度要在进了布局之后算（和 add 里同一个理由）
         self._fit_bubble(b)
@@ -951,8 +1004,10 @@ class FlyoutWindow(QWidget):
             except Exception:
                 pass
 
-        room_right = geo.right() - (pet.right() + GAP) + 1
-        room_left = (pet.left() - GAP) - geo.left()
+        # 空隙跟鱼身宽成比例（2% ~ 12px），小鱼的板子不会离得远、大鱼也不会贴太紧
+        gap = max(GAP, min(12, int(round(pet.width() * GAP_RATIO))))
+        room_right = geo.right() - (pet.right() + gap) + 1
+        room_left = (pet.left() - gap) - geo.left()
         side = "right" if room_right >= room_left else "left"
         room = max(room_right, room_left)
 
@@ -974,7 +1029,7 @@ class FlyoutWindow(QWidget):
             else:
                 w, h = self.width(), self.height()
 
-        x = pet.right() + GAP if side == "right" else pet.left() - GAP - w
+        x = pet.right() + gap if side == "right" else pet.left() - gap - w
         y = pet.top() - 14                          # 卡片顶比鱼头高一点点，别顶到眼睛
         x = max(geo.left(), min(x, geo.right() - w + 1))
         y = max(geo.top(), min(y, geo.bottom() - h + 1))
@@ -986,15 +1041,15 @@ class FlyoutWindow(QWidget):
         _card = QRect(x + MARGIN, y + MARGIN, _w_use - 2 * MARGIN, _h_use - 2 * MARGIN)
         if _card.intersects(pet):
             _other = "left" if side == "right" else "right"
-            _ox = pet.right() + GAP if _other == "right" else pet.left() - GAP - _w_use
+            _ox = pet.right() + gap if _other == "right" else pet.left() - gap - _w_use
             _ox = max(geo.left(), min(_ox, geo.right() - _w_use + 1))
             if not QRect(_ox + MARGIN, y + MARGIN,
                          _w_use - 2 * MARGIN, _h_use - 2 * MARGIN).intersects(pet):
                 x, side = _ox, _other
             else:
-                _oy = pet.bottom() + GAP
+                _oy = pet.bottom() + gap
                 if _oy + _h_use > geo.bottom():
-                    _oy = max(geo.top(), pet.top() - GAP - _h_use)
+                    _oy = max(geo.top(), pet.top() - gap - _h_use)
                 y = _oy
                 x = max(geo.left(), min(pet.center().x() - _w_use // 2,
                                         geo.right() - _w_use + 1))
@@ -1466,6 +1521,13 @@ class FlyoutWindow(QWidget):
             pass
         self._fit_status()
         self._fit_chips()
+        # 消息里那几排按钮（派活结果下面那两颗）也跟着重排
+        try:
+            for cb in self.body.findChildren(_ChipBox):
+                _fit_chipbox(cb, getattr(cb, "_dfy_btns", []),
+                             max(120, self.width() - 2 * MARGIN - 20))
+        except (RuntimeError, AttributeError):
+            pass
 
     def enterEvent(self, ev):
         """光标进到板子上：停住跟随（否则按钮一直在躲光标，点不中）。"""
