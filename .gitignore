@@ -19,3 +19,11 @@ __pycache__/
 
 # 运行时自动合成的音效（由 assets 里的分段 wav 拼出来）
 assets/click-*.wav
+
+# 灵动版帧序列：239MB / 7962 个 webp，不进仓库（2026-10-27 主人定）
+# 新克隆没有这个目录 → 跑 `python _build/regen_anim_hd.py` 重新生成（约 30 分钟，要显卡）；
+# 没有它程序会自动退回三视图，不会崩。
+sprites_anim/
+
+# 临时备份
+*.bak

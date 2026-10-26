@@ -28,9 +28,9 @@ from PySide6.QtGui import (QColor, QCursor, QFont, QIcon, QImage, QPainter,
                            QPainterPath, QPen, QPixmap, QRegion, QWheelEvent)
 from PySide6.QtWidgets import (QAbstractButton, QAbstractScrollArea,
                                QAbstractSlider, QApplication, QButtonGroup,
-                               QColorDialog, QComboBox, QFileDialog, QFrame,
+                               QColorDialog, QComboBox, QDialog, QFileDialog, QFrame,
                                QGridLayout, QHBoxLayout, QInputDialog, QLabel,
-                               QLineEdit, QListWidget, QListWidgetItem, QPushButton,
+                               QLineEdit, QListWidget, QListWidgetItem, QPlainTextEdit, QPushButton,
                                QScrollArea, QScrollBar,
                                QSizePolicy, QSlider, QStackedWidget,
                                QVBoxLayout, QWidget)
@@ -640,7 +640,7 @@ QPushButton#danger:hover { background: $surface_alt; border-color: $danger;
                            color: $danger; }
 QPushButton#winBtn { background: transparent; border: none; padding: 5px; border-radius: 6px; }
 QPushButton#winBtn:hover { background: $surface_alt; }
-/* 「控制台外观」里那排色卡：色块本身不带字，选中靠一圈描边 */
+/* 「界面外观」里那排色卡：色块本身不带字，选中靠一圈描边 */
 QPushButton#swatch { background: transparent; border: 2px solid transparent;
                      border-radius: 8px; padding: 0px; }
 QPushButton#swatch:hover { background: transparent; border-color: $text_faint; }
@@ -745,7 +745,7 @@ def build_qss(glass=False):
     data = dict(tokens())
     data["chevron"] = icon_path("ui.chevron-down").replace("\\", "/")
     data["shell_radius"] = "%dpx" % SHELL_RADIUS
-    # 卡片那两个格子：默认就是实心 + 12px 圆角，用户在「控制台外观」里能改
+    # 卡片那两个格子：默认就是实心 + 12px 圆角，用户在「界面外观」里能改
     data["card"] = _rgba(tokens()["surface"], _card_alpha)
     data["card_radius"] = "%dpx" % int(_card_radius)
     out = _QSS.substitute(data)
@@ -1519,6 +1519,91 @@ class ShellFrame(QFrame):
 # --------------------------------------------------------------------------- #
 # 控制台窗口
 # --------------------------------------------------------------------------- #
+def _sync_combo(box, names, current):
+    """把下拉框的选项和当前值对齐 —— 主人自己加 / 删过音效后回到这一页时要的。"""
+    names = list(names)
+    shown = [box.itemText(i) for i in range(box.count())]
+    if shown != names:
+        box.blockSignals(True)
+        box.clear()
+        for name in names:                  # 值就是名字，跟 page.combo 建的时候一样
+            box.addItem(name, name)
+        box.blockSignals(False)
+    for i in range(box.count()):
+        if box.itemData(i) == current:
+            if box.currentIndex() != i:
+                box.blockSignals(True)
+                box.setCurrentIndex(i)
+                box.blockSignals(False)
+            break
+
+
+class AgentDialog(QDialog):
+    """添加 / 编辑一个派活 Agent（拖文件时那排按钮里的一项）。"""
+
+    def __init__(self, owner, spec=None):
+        super().__init__(owner)
+        is_new = spec is None
+        self.setWindowTitle("手动添加 Agent" if is_new else "编辑 Agent")
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self.setModal(True)
+        self.setMinimumWidth(560)
+        self.result_spec = None
+        src = dict(spec or {})
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 16, 18, 14)
+        lay.setSpacing(8)
+
+        def field(title, value, hint=""):
+            lay.addWidget(QLabel(title))
+            ed = QLineEdit(str(value or ""))
+            ed.setMinimumHeight(32)
+            if hint:
+                ed.setPlaceholderText(hint)
+            lay.addWidget(ed)
+            return ed
+
+        self.ed_label = field("按钮上显示的名字", src.get("label", ""), "比如 Claude / Pi / 我的助手")
+        self.ed_cmd = field("命令（可执行名或完整路径）", src.get("cmd", ""),
+                            "比如 claude、codex、C:////Tools////pi.cmd")
+        self.ed_args = field("参数（空格分隔）", src.get("args", ""), "比如 -p")
+        self.ed_dirs = field("额外目录参数（没有就留空）", src.get("add_dir_flag", ""),
+                             "codex 是 --add-dir；dsh / claude 没有就留空")
+
+        tip = QLabel("⚠️ 任务文字是从标准输入（stdin）喂进去的，所以这个命令必须“不给任务参数"
+                     "就从 stdin 读”。codex exec / dsh - / claude -p 都符合。")
+        tip.setWordWrap(True)
+        tip.setObjectName("rowDesc")
+        lay.addWidget(tip)
+
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        cancel = QPushButton("取消")
+        cancel.clicked.connect(self.reject)
+        btns.addWidget(cancel)
+        ok = QPushButton("保存")
+        ok.setDefault(True)
+        ok.clicked.connect(self._commit)
+        btns.addWidget(ok)
+        lay.addLayout(btns)
+
+    def _commit(self):
+        label = self.ed_label.text().strip()
+        cmd = self.ed_cmd.text().strip()
+        if not label or not cmd:
+            self.setWindowTitle("名字和命令都要填")
+            return
+        self.result_spec = {
+            "label": label,
+            "key": label,
+            "cmd": cmd,
+            "args": self.ed_args.text().strip(),
+            "add_dir_flag": self.ed_dirs.text().strip(),
+        }
+        self.accept()
+
+
 class ConsoleWindow(QWidget):
     """设置窗口本体。pet 是桌宠（PetWindow），ctx 是 桌宠.py 递进来的常量/函数表。
 
@@ -1527,21 +1612,26 @@ class ConsoleWindow(QWidget):
     """
 
     PAGES = [
-        ("balance", "余额和用量", "Key、来源、今日已用怎么算",
+        ("balance", "余额和用量", "Key、来源、今日已用、峰谷时段",
          "nav.balance", "_page_balance"),
         ("appearance", "桌宠形象", "换成谁、多大、多透明、在哪一层",
          "nav.appearance", "_page_appearance"),
-        ("console", "控制台外观", "背景、标题、图标，都随你",
+        ("console", "界面外观", "背景、标题、图标，都随你",
          "nav.console", "_page_console"),
-        ("behavior", "动作和互动", "怎么走、双击做什么、怎么防误触",
+        ("behavior", "动作和互动", "怎么走、双击、防误触、拖拽吸附",
          "nav.behavior", "_page_behavior"),
         ("weather", "天气和城市", "看哪个城市的天气", "nav.weather", "_page_weather"),
         ("music", "音乐和歌词", "放歌时跟着唱", "nav.music", "_page_music"),
-        ("lines", "文案和语录", "闲着时说什么、高峰时段怎么显示",
+        ("lines", "文案和语录", "闲着时说什么",
          "nav.lines", "_page_lines"),
-        ("sound", "音效", "按键音效、音量、自己加的音频", "nav.sound", "_page_sound"),
-        ("integration", "应用联动", "应用启动 / 使用时长 / 定时提醒、全局快捷键",
+        ("sound", "音效", "点击音、任务完成提示音、音量，都在这儿",
+         "nav.sound", "_page_sound"),
+        ("integration", "应用联动", "应用启动 / 时长 / 定时 / 免打扰",
          "nav.integration", "_page_integration"),
+        ("chattune", "聊天", "她记得什么、用什么人设",
+         "ui.chat", "_page_chattune"),
+        ("dispatch", "派活", "拖文件交给哪个 Agent，可以自己加",
+         "ui.chat", "_page_dispatch"),
         ("performance", "性能和工具", "流畅度、回收内存",
          "nav.performance", "_page_performance"),
         ("general", "通用", "显示、主题、开机自启、排查",
@@ -1699,7 +1789,7 @@ class ConsoleWindow(QWidget):
         brand.addWidget(self.brand_label)
         brand.addStretch(1)
         box.addLayout(brand)
-        # 名字和图标都能改成自己的（「控制台外观」那一页）
+        # 名字和图标都能改成自己的（「界面外观」那一页）
         self._apply_brand()
 
         # ---- 设置项搜索 ----
@@ -1766,6 +1856,16 @@ class ConsoleWindow(QWidget):
         terms = [t for t in query.lower().split() if t]
         hits = []
         for ent in self._search_index:
+            # 跳过"按当前形象藏起来"的行（「它会做什么」那张卡两块只显示一块）：
+            # 搜到一条点进去看不见，比搜不到更让人困惑。
+            # ⚠️ 参照物必须是**它自己那一页**（`isVisibleTo(page)` = "这一页显示出来时
+            # 它会不会出现"）。传 `self` 不行：QStackedWidget 里非当前页整个是隐藏的，
+            # 会把别的页的条目全过滤掉；传 `w.parent()` 也不行，那一层就是被藏起来的容器本身。
+            w = ent.get("widget")
+            page_w = self._pages.get(ent.get("key"))
+            if (w is not None and page_w is not None
+                    and hasattr(w, "isVisibleTo") and not w.isVisibleTo(page_w)):
+                continue
             blob = " ".join((ent["title"], ent["desc"], ent["page"])).lower()
             if all(t in blob for t in terms):
                 hits.append(ent)
@@ -1907,7 +2007,7 @@ class ConsoleWindow(QWidget):
         return pix.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio,
                           Qt.TransformationMode.SmoothTransformation)
 
-    # ---------------- 控制台外观：背景 / 标题 / 图标 ----------------
+    # ---------------- 界面外观：背景 / 标题 / 图标 ----------------
     # 这一块只管"设置窗口自己长什么样"，跟桌宠本体一点关系都没有。
     # 设置存 config.json 里那几个 console_ 开头的键（BACKDROP_DEFAULTS）。
     def _bg(self, key):
@@ -2560,6 +2660,18 @@ class ConsoleWindow(QWidget):
 
         card = page.card("今日已用怎么算", "按余额差值算，可能和平台对不上",
                          "page.calibrate")
+        page.hint(card, "每次刷新余额就把差额记一笔，不用平台令牌。"
+                        "想按 token 用量算，看下面「每轮消耗统计」。")
+        page.row(card, "校准今日已用", "按平台用量页对一次数",
+                 self._text_button("校准…",
+                                   lambda: self._run(pet.calibrate_usage_dialog),
+                                   "primary", "page.calibrate"))
+
+        # 和上面那张卡是**两套完全不同的机制**，以前揉在一张卡里：
+        # 上面是余额差值本地记账（usage.json），这里是读会话日志的 token 用量、按峰谷价换算。
+        # 拆开之后两套开关各自独立，关掉一个不影响另一个。
+        card = page.card("每轮消耗统计", "读会话日志里的 token 用量，按峰谷价换算",
+                         "page.clock")
         page.row(card, f"每轮对话后显示消耗（当前：{pet.agent_name}）",
                  f"读 {pet.agent_name} 的会话日志，算这一轮用掉多少",
                  Switch(pet.turn_cost_on, pet.set_turn_cost))
@@ -2567,11 +2679,18 @@ class ConsoleWindow(QWidget):
                  self._pair_buttons(
                      ("名称…", lambda: self._run(pet.set_agent_name_dialog)),
                      ("日志目录…", lambda: self._run(pet.set_agent_dir_dialog))))
-        page.divider(card)
-        page.row(card, "校准今日已用", "按平台用量页对一次数",
-                 self._text_button("校准…",
-                                   lambda: self._run(pet.calibrate_usage_dialog),
-                                   "primary", "page.calibrate"))
+
+        # 从「文案和语录」搬来的：峰谷时段是 DeepSeek 的**计价时段**，
+        # 显示在余额气泡的第四行 —— 和"余额 / 用量"是一件事
+        card = page.card("高峰 / 空闲时段", "DeepSeek 不同时段价格不同",
+                         "page.clock")
+        page.row(card, "显示当前峰谷时段", "在余额气泡中标注高峰或空闲",
+                 Switch(pet.show_peak, pet.set_show_peak))
+        page.combo(card, "峰谷文案", "选择文案风格",
+                   [(name, name) for name
+                    in (self.ctx.get("PEAK_TEXT_STYLES") or {})],
+                   pet.peak_style,
+                   lambda style: self._run(pet.set_peak_style, style))
 
     def _sync_source_controls(self):
         """余额来源那一栏现读：自己加 / 删过服务、换过 Key 之后要说得出现在是啥。"""
@@ -2700,6 +2819,21 @@ class ConsoleWindow(QWidget):
         ])
 
     # ---------------- 形象与外观 ----------------
+    def _skin_seg_options(self):
+        """形象选择的那排档位：三视图 / 挂件 / 灵动版。
+
+        灵动版（视频拆帧、带真动作）只在素材目录存在时才出现 —— 素材没搬过来时
+        多一档点了也没用，不如不显示。`ctx["SKIN_ANIM"]` 为空串就是没有。
+        """
+        skin_pet = self.ctx.get("SKIN_PET", "大肥鱼")
+        skin_widget = self.ctx.get("SKIN_WIDGET", "小鲸鱼挂件")
+        opts = [(skin_pet, self._skin_option_text("pet", skin_pet, "（三视图）")),
+                (skin_widget, self._skin_option_text("widget", skin_widget, "（单张）"))]
+        skin_anim = self.ctx.get("SKIN_ANIM") or ""
+        if skin_anim:
+            opts.append((skin_anim, f"{skin_anim}（带动作）"))
+        return opts
+
     def _page_appearance(self, page):
         pet = self.pet
         skin_pet = self.ctx.get("SKIN_PET", "大肥鱼")
@@ -2707,9 +2841,8 @@ class ConsoleWindow(QWidget):
         card = page.card("形象", "换形象、上传自己的图", "nav.appearance")
         # 「现在是谁」和"形象库有几个"都是会变的：建的时候摆一次，
         # 之后每次切到这一页（或把窗口重新露出来）都按实际状态重摆（见 _sync_skin_controls）
-        self.skin_seg = Segmented([(skin_pet, self._skin_option_text("pet", skin_pet, "（三视图）")),
-                                   (skin_widget, self._skin_option_text("widget", skin_widget, "（单张）"))],
-                                  pet.skin, lambda name: self._run(pet.set_skin, name))
+        self.skin_seg = Segmented(self._skin_seg_options(), pet.skin,
+                                  lambda name: self._run(pet.set_skin, name))
         page.row(card, "现在是谁", "", self.skin_seg)
         row = page.buttons(card, [
             (self._skin_lib_text(),
@@ -2752,10 +2885,7 @@ class ConsoleWindow(QWidget):
         page.row(card, "气泡风格", "语录、余额、歌词三种气泡一起换",
                  self.bubble_seg)
         page.row(card, "窗口层级", "相对其他窗口的层级", self._layer_combo())
-        page.row(card, "拖拽吸附四边", "拖到屏幕边缘时自动吸附",
-                 Switch(pet.snap_on, pet.set_snap))
-        page.row(card, "左吸附时翻面", "吸附左侧时朝向屏幕内侧",
-                 Switch(pet.flip_on_left, pet.set_flip_on_left))
+        # 拖拽吸附那两项是**拖拽行为**，不是外观，已搬到「动作和互动」（见 _page_behavior）
 
     def _skin_lib_text(self):
         """「我的形象库…」按钮上的字：条目数**现读**，不存下来。"""
@@ -2812,6 +2942,10 @@ class ConsoleWindow(QWidget):
                           f"{self._skin_name('pet', skin_pet)}（三视图）")
             seg.set_label(skin_widget, self._skin_option_text("widget", skin_widget, "（单张）"),
                           f"{self._skin_name('widget', skin_widget)}（单张）")
+            # 灵动版的档位文字是固定的（它不是库里的形象，不跟着换）
+            skin_anim = self.ctx.get("SKIN_ANIM") or ""
+            if skin_anim:
+                seg.set_label(skin_anim, f"{skin_anim}（带动作）", f"{skin_anim}（带动作）")
             # clear_custom_skin 可能把挂件退回"大肥鱼"，这里跟着对上
             seg.set_value(getattr(self.pet, "skin", None))
         bubble = getattr(self, "bubble_seg", None)
@@ -2827,7 +2961,7 @@ class ConsoleWindow(QWidget):
         self._run(self.pet.clear_custom_skin, None)
         self._sync_skin_controls()
 
-    # ---------------- 控制台外观 ----------------
+    # ---------------- 界面外观 ----------------
     def _page_console(self, page):
         card = page.card("背景", "铺在窗口最底下", "page.layers")
         # 只有"导入文件"这一个入口：图片 / 视频一起给，是哪种看后缀。
@@ -2906,7 +3040,7 @@ class ConsoleWindow(QWidget):
         card = page.card("恢复默认", "一把清干净", "ui.reset")
         page.buttons(card, [("全部恢复默认", self._reset_console_look, "danger", "ui.reset")])
 
-    # ---- 控制台外观：动一下就要顺手存盘 ----
+    # ---- 界面外观：动一下就要顺手存盘 ----
     def _pick_backdrop(self):
         """导入背景：图片和视频一起给，是哪种看后缀（不再让用户先选一次类型）。"""
         path = self._ask_file("挑一张图或一段视频", MEDIA_FILTER, self._bg_path())
@@ -3090,18 +3224,128 @@ class ConsoleWindow(QWidget):
                  Switch(pet.cfg.get("passthrough", False), pet.set_passthrough))
         page.hint(card, "若已无法点击：双击托盘图标，或在「通用」中执行救急恢复。")
 
+        # 从「桌宠形象 → 外观」搬过来的：这两项管的是**拖拽时的行为**，不是外观
+        card = page.card("拖拽和吸附", "拖到屏幕边上会自动贴过去", "page.magnet")
+        page.row(card, "拖拽吸附四边", "拖到屏幕边缘时自动吸附",
+                 Switch(pet.snap_on, pet.set_snap))
+        page.row(card, "左吸附时翻面", "吸附左侧时朝向屏幕内侧",
+                 Switch(pet.flip_on_left, pet.set_flip_on_left))
+
+        self._card_what_it_does(page)
+
+    def _card_what_it_does(self, page):
+        """「它会做什么」：当前形象能做的动作，能试、能关。
+
+        两种形象的机制**完全不同**，所以卡片里是两块，按当前形象显示其中一块：
+          - 灵动版：30 段真帧动作。闲着时是**循环播待机素材**，不会自己乱放动作，
+            所以只给「挑一个 / 试试 / 随机来一个」，没有开关
+            （`actions_off` 只管三视图那三个程序化小动作）。
+          - 三视图 / 挂件：蹦跳 / 摇摆 / 拉伸。闲着时按 35 / 25 / 10 的权重自己抽，
+            每条一个开关；关掉的那条随机和菜单都不会再出现（菜单里置灰保留）。
+
+        ⚠️ 设置窗口是**建一次留着**的（`open_console` 只抬窗口），所以形象改了以后
+        这张卡不能靠"重建"更新 —— 两块都建好、切页时按 `pet.skin` 显示其中一块
+        （`_sync_actions_card`，挂在 `_hook_page("behavior")` 上）。
+        隐藏的那块在搜索里也要跳过，见 `_do_search` 里的 `isVisibleTo`。
+
+        依据：AGENTS.md 里 P2 的尾巴（主人 2026-10-25 定：「加一张『它会做什么』卡片
+        （开关 + 频率 + 预览）」）。
+        """
+        pet = self.pet
+        card = page.card("它会做什么", "闲着时自己做的小动作，能试、能关", "nav.behavior")
+
+        # ---- 灵动版那块 ----
+        self._act_anim_box = QWidget()
+        box_a = QVBoxLayout(self._act_anim_box)
+        box_a.setContentsMargins(0, 0, 0, 0)
+        box_a.setSpacing(11)
+        card.addWidget(self._act_anim_box)
+
+        _anim = (getattr(pet, "ext", None) or {}).get("anim")
+        choices = _anim.once_choices() if _anim is not None else []
+        page.hint(box_a, "现在是灵动版：闲着的时候循环播待机素材，"
+                         "**不会自己乱放动作**。想让它动，点右键「逗她一下」，"
+                         "或者在下面挑一个试试。")
+        if choices:
+            self._act_pick = choices[0][1]
+            combo = QComboBox()
+            for label, clip in choices:
+                combo.addItem(label, clip)
+            combo.setFixedHeight(32)
+            combo.currentIndexChanged.connect(
+                lambda i: setattr(self, "_act_pick", combo.itemData(i)))
+            page.row(box_a, f"挑一个动作（共 {len(choices)} 段）",
+                     "选中后点「试试」，它立刻做给你看", combo)
+            page.buttons(box_a, [
+                ("试试", lambda: self._run(pet._play_anim_clip,
+                                           getattr(self, "_act_pick", choices[0][1])),
+                 "primary", None),
+                ("随机来一个", lambda: self._run(pet._tease), None, None),
+            ])
+        else:
+            page.hint(box_a, "没找到动作素材（`sprites_anim` 目录在不在？）")
+
+        # ---- 三视图 / 挂件那块 ----
+        self._act_plain_box = QWidget()
+        box_b = QVBoxLayout(self._act_plain_box)
+        box_b.setContentsMargins(0, 0, 0, 0)
+        box_b.setSpacing(11)
+        card.addWidget(self._act_plain_box)
+
+        items = self.ctx.get("ACTIONS") or {}
+        page.hint(box_b, "现在是三视图 / 挂件：闲着时有三成概率自己来一个小动作。"
+                         "关掉的那条不会自己出现，右键菜单里会置灰保留（不是凭空消失）。")
+        for key, info in items.items():
+            label = info[0] if info else key
+            wrap = QWidget()
+            line = QHBoxLayout(wrap)
+            line.setContentsMargins(0, 0, 0, 0)
+            line.setSpacing(8)
+            try_btn = self._text_button("试试", lambda k=key: self._run(pet.play_action, k))
+            sw = Switch(key not in (pet.cfg.get("actions_off") or ()))
+            # 行说明要给初值 —— `page.row` 只有 desc 非空时才建 `desc_label`，
+            # 传空串的话后面 `_say` 就改不动它了（第一版就是这么把说明弄丢的）
+            row = page.row(box_b, label,
+                           "闲着时会自己来一个" if sw.isChecked()
+                           else "已关闭：不会自己出现，菜单里置灰", wrap)
+
+            def _say(on, r=row):
+                if r.desc_label is not None:
+                    r.desc_label.setText("闲着时会自己来一个" if on
+                                         else "已关闭：不会自己出现，菜单里置灰")
+
+            # 关掉时「试试」一起灰掉 —— `play_action` 对关掉的动作直接 return，
+            # 留着能点会让人以为坏了
+            def _toggle(checked, k=key, btn=try_btn, r=row):
+                self._run(pet.set_action_enabled, k, checked)
+                btn.setEnabled(bool(checked))
+                _say(bool(checked), r)
+
+            sw.toggled.connect(_toggle)
+            try_btn.setEnabled(sw.isChecked())
+            _say(sw.isChecked())
+            line.addWidget(try_btn)
+            line.addWidget(sw)
+
+        self._sync_actions_card()
+        self._hook_page("behavior", self._sync_actions_card)
+
+    def _sync_actions_card(self):
+        """按当前形象显示「它会做什么」的其中一块（形象换了、切回这一页时都会跑）。"""
+        anim_skin = self.ctx.get("SKIN_ANIM") or ""
+        is_anim = bool(anim_skin) and self.pet.skin == anim_skin
+        a = getattr(self, "_act_anim_box", None)
+        b = getattr(self, "_act_plain_box", None)
+        if a is not None:
+            a.setVisible(is_anim)
+        if b is not None:
+            b.setVisible(not is_anim)
+
     # ---------------- 文案与语录 ----------------
     def _page_lines(self, page):
         pet = self.pet
-        card = page.card("高峰 / 空闲时段", "DeepSeek 不同时段价格不同",
-                         "nav.lines")
-        page.row(card, "显示当前峰谷时段", "在余额气泡中标注高峰或空闲",
-                 Switch(pet.show_peak, pet.set_show_peak))
-        page.combo(card, "峰谷文案", "选择文案风格",
-                   [(name, name) for name
-                    in (self.ctx.get("PEAK_TEXT_STYLES") or {})],
-                   pet.peak_style,
-                   lambda style: self._run(pet.set_peak_style, style))
+        # 「高峰 / 空闲时段」是 DeepSeek 的**计价时段**，显示在余额气泡的第四行，
+        # 跟"余额 / 用量"是同一件事 —— 已搬到「余额和用量」（见 _page_balance）
 
         card = page.card("语录", "闲置时自动说话", "ui.quote")
         levels = list((self.ctx.get("LINE_FREQ_LEVELS") or {}).items())
@@ -3110,11 +3354,8 @@ class ConsoleWindow(QWidget):
                     for name, conf in levels],
                    pet.line_freq,
                    lambda name: self._run(pet.set_line_freq, name))
-        page.row(card, "离开 / 返回提醒", "离开超过 30 分钟后返回时提醒一次",
-                 Switch(pet.cfg.get("back_greet", True), pet.set_back_greet))
-        page.row(card, "全屏时静音", "全屏（游戏 / 视频）时不显示气泡，提醒暂存",
-                 Switch(pet.cfg.get("fullscreen_silent", True),
-                        pet.set_fullscreen_silent))
+        # 「离开 / 返回提醒」和「全屏时静音」管的是**什么时候不说话**，
+        # 和这张卡的"说什么、说多勤"是两件事 —— 已拆出去搬到「应用联动」
 
         # 语录板块：哪几块参与说话（关掉的整块不再开口，台词本身留着）
         self.section_switches = {}
@@ -3160,43 +3401,61 @@ class ConsoleWindow(QWidget):
     # ---------------- 音效 ----------------
     def _page_sound(self, page):
         pet = self.pet
-        card = page.card("音效", "点击、拖拽时的音效", "nav.sound")
+
+        # 第 1 张卡：点击音效（老的一套，行为一行没动）
+        card = page.card("点击音效", "点它、拖它时那一声", "nav.sound")
         page.row(card, "按键音效", "关闭后无音效",
                  Switch(pet.sound_on, pet.set_sound))
         self.sound_combo = page.combo(card, "音效选择", "内置若干套，可自行添加",
                                       [(name, name) for name in pet._sound_names()],
                                       pet.sound_set,
                                       lambda name: self._run(pet.set_sound_set, name))
-        page.slider(card, "音量", "", 0, 100, int(pet.volume * 100), "%",
+        page.slider(card, "音量", "全局音量，下面那个提示音也跟着它", 0, 100,
+                    int(pet.volume * 100), "%",
                     lambda v: self._run(pet.set_volume, v / 100.0))
         page.buttons(card, [
             ("试听", lambda: pet.preview_sounds(), "primary", "page.volume-high"),
             ("添加我的音效…", self._add_sound, None, "ui.add"),
             ("删掉我加的音效…", self._remove_sound, "danger", "ui.delete"),
         ])
+
+        # 第 2 张卡：任务完成提示音 —— **独立一套**（主人 2026-10-24 的要求：
+        # 不要和点击音挤在同一个模块里，但归在「音效」大板块下）。
+        # 能力和点击音对齐：开关 / 选音源 / 试听 / 换成自己的 / 删掉自己的。
+        card2 = page.card("任务完成提示音", "AI 任务跑完时响一声，气泡不受影响", "nav.sound")
+        page.row(card2, "启用提示音", "关掉只影响声音，气泡照旧",
+                 Switch(bool(pet.cfg.get("task_notify_sound", True)),
+                        pet.set_task_notify_sound))
+        self.task_sound_combo = page.combo(
+            card2, "提示音选择", "内置一声「叮」，也能用你自己的（1 分钟以内）",
+            [(name, name) for name in pet.task_sound_names()],
+            pet.cfg.get("task_sound_set", "叮"),
+            lambda name: self._run(pet.set_task_sound_set, name))
+        page.buttons(card2, [
+            ("试听", lambda: pet.preview_task_sound(), "primary", "page.volume-high"),
+            ("换成我的音频…", self._add_task_sound, None, "ui.add"),
+            ("删掉我加的…", self._remove_task_sound, "danger", "ui.delete"),
+        ])
         self._hook_page("sound", self._sync_sound_controls)
 
     def _sync_sound_controls(self):
         """音效名单现读一遍：自己加 / 删过的，回到这一页就看得见（不用重启）。"""
-        box = getattr(self, "sound_combo", None)
-        if box is None:
-            return
         pet = self.pet
-        names = list(pet._sound_names())
-        shown = [box.itemText(i) for i in range(box.count())]
-        if shown != names:
-            box.blockSignals(True)
-            box.clear()
-            for name in names:                      # 值就是名字，跟 page.combo 建的时候一样
-                box.addItem(name, name)
-            box.blockSignals(False)
-        for i in range(box.count()):
-            if box.itemData(i) == pet.sound_set:
-                if box.currentIndex() != i:
-                    box.blockSignals(True)
-                    box.setCurrentIndex(i)
-                    box.blockSignals(False)
-                break
+        box = getattr(self, "sound_combo", None)
+        if box is not None:
+            _sync_combo(box, list(pet._sound_names()), pet.sound_set)
+        box2 = getattr(self, "task_sound_combo", None)
+        if box2 is not None:
+            _sync_combo(box2, list(pet.task_sound_names()),
+                        pet.cfg.get("task_sound_set", "叮"))
+
+    def _add_task_sound(self):
+        self._run(self.pet.add_task_sound_dialog)
+        self._sync_sound_controls()
+
+    def _remove_task_sound(self):
+        self._run(self.pet.remove_task_sound_dialog)
+        self._sync_sound_controls()
 
     def _add_sound(self):
         self._run(self.pet.add_custom_sound_dialog)
@@ -3249,6 +3508,29 @@ class ConsoleWindow(QWidget):
         page.buttons(card, [("配置按键与动作…",
                              self._open_hotkeys, "primary", "ui.edit")])
         self.hotkey_hint = page.hint(card, self._hotkey_text(), "muted")
+
+        # ---- 以下两张卡都是「什么时候闭嘴」，和上面三张"什么时候提醒"配成一对 ----
+        # 从「文案和语录 → 语录」拆出来的：那卡管的是"说什么、说多勤"，不是"什么时候不说"
+        card = page.card("什么时候不说话", "安静的时候别来打扰", "ui.bell-off")
+        page.row(card, "离开 / 返回提醒", "离开超过 30 分钟后返回时提醒一次",
+                 Switch(pet.cfg.get("back_greet", True), pet.set_back_greet))
+        page.row(card, "全屏时静音", "全屏（游戏 / 视频）时不显示气泡，提醒暂存",
+                 Switch(pet.cfg.get("fullscreen_silent", True),
+                        pet.set_fullscreen_silent))
+
+        # 免打扰从「性能和工具」搬过来：它是提醒的静音开关，和"性能"毫无关系
+        card = page.card("免打扰", "开启期间不显示气泡，提醒暂存，结束后汇总",
+                         "ui.bell-off")
+        page.slider(card, "默认时长", "菜单中「免打扰」使用的时长",
+                    5, 180, int(pet.cfg.get("quiet_minutes") or 30), " 分钟",
+                    lambda v: self._run(pet.set_quiet_minutes, v))
+        page.buttons(card, [
+            ("开始免打扰", lambda: self._run(pet.start_quiet), "primary", "ui.bell-off"),
+            ("结束免打扰", lambda: self._run(pet.stop_quiet), None, "ui.reset"),
+        ])
+        self.quiet_hint = page.hint(card, self._quiet_text(), "muted")
+        self._hook_page("integration", self._sync_tool_texts)
+
         self._hook_page("integration", self._sync_autosay_texts)
 
     # 三个"配置…"按钮：窗口关掉之后顺手把下面那行小字重读一遍
@@ -3325,19 +3607,7 @@ class ConsoleWindow(QWidget):
         page.buttons(card, [("回收内存", lambda: pet.mem_trim_now(), "primary", "page.sparkle")])
         # 回收是后台跑的，点完这一下数还不准 —— 回到这一页时现读一遍就够了
         self._hook_page("performance", self._sync_mem_hint)
-
-        card = page.card("免打扰", "开启期间不显示气泡，提醒暂存，结束后汇总",
-                         "ui.bell-off")
-        page.slider(card, "默认时长", "菜单中「免打扰」使用的时长",
-                    5, 180, int(pet.cfg.get("quiet_minutes") or 30), " 分钟",
-                    lambda v: self._run(pet.set_quiet_minutes, v))
-        page.buttons(card, [
-            ("开始免打扰", lambda: self._run(pet.start_quiet), "primary", "ui.bell-off"),
-            ("结束免打扰", lambda: self._run(pet.stop_quiet), None, "ui.reset"),
-        ])
-        self.quiet_hint = page.hint(card, self._quiet_text(), "muted")
-
-        self._hook_page("performance", self._sync_tool_texts)
+        # 「免打扰」已搬到「应用联动」—— 它是提醒的静音开关，和"性能"毫无关系
 
     def _quiet_text(self):
         left = self.pet.quiet_left()
@@ -3374,6 +3644,407 @@ class ConsoleWindow(QWidget):
                 switch.setChecked(want)
                 switch.blockSignals(False)
 
+    # ---------------- 聊天 ----------------
+    def _page_chattune(self, page):
+        """聊天：记忆（看 / 清空）+ 人格（整段可改）。"""
+        pet = self.pet
+        from pet_ext import chat as cmod
+        ext = (getattr(pet, "ext", None) or {}).get("chat")
+
+        card = page.card("记忆", "她记得你们聊过什么（只存在这台机器上）", "ui.chat")
+        if ext is None:
+            page.hint(card, "聊天模块没加载（pet_ext/chat.py）。")
+        else:
+            limit = ext.history_limit()
+            n = len(getattr(ext, "history", []) or [])
+            page.combo(card, "最多记住多少条",
+                       "一问一答算两条；超出的自动丢最老的，上下文不会越聊越长",
+                       [(v, f"{v} 条（{v // 2} 轮）") for v in cmod.MEMORY_CHOICES],
+                       limit, self._set_memory_max)
+            # 记着这个标签：下拉换了上限时直接改它，**别整页重建** ——
+            # 在 `currentIndexChanged` 里把下拉自己删掉是自找麻烦。
+            self._mem_count = page.hint(card, self._mem_count_text(n, limit))
+            page.buttons(card, [
+                ("看一眼最近几条", self._peek_chat_memory, None, None),
+                ("清空记忆", self._clear_chat_memory, "danger", None),
+            ], align_right=False)
+            page.hint(card, "「清空」之后她就完全不记得之前聊过什么了（一问一答一起清）。")
+
+        card2 = page.card("人格", "这段文字每次聊天都会先发给她，决定语气和边界", "ui.chat")
+        page.hint(card2, "留空 / 点「恢复默认」就用内置人格。改完记得点保存。")
+        ed = QPlainTextEdit()
+        ed.setObjectName("personaEdit")
+        ed.setPlainText(str(pet.cfg.get("chat_persona") or "").strip()
+                        or cmod.SYSTEM_PROMPT.strip())
+        ed.setMinimumHeight(210)
+        card2.addWidget(ed)
+        self._persona_edit = ed
+        page.buttons(card2, [
+            ("保存人格", self._save_persona, "primary", None),
+            ("恢复默认", self._reset_persona, None, None),
+        ], align_right=False)
+        page.hint(card2, "人格只影响聊天（走 API 那条）；派活给 Agent 的提示词是另一套，不受影响。")
+
+    def _chat_ext(self):
+        return (getattr(self.pet, "ext", None) or {}).get("chat")
+
+    def _mem_count_text(self, n, limit):
+        return f"现在记着 {n} 条（约 {n // 2} 轮），上限 {limit} 条。"
+
+    def _set_memory_max(self, value):
+        """改了「最多记住多少条」：立刻落盘，并按新上限裁一次（改小要马上生效）。"""
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            return
+        self.pet.cfg["chat_memory_max"] = n
+        try:
+            self.pet.save_config()
+        except Exception:
+            pass
+        ext = self._chat_ext()
+        if ext is not None:
+            hist = list(getattr(ext, "history", []) or [])
+            if len(hist) > n:
+                ext.history = hist[-n:]      # 调小就当场砍掉最老的，别等下一句话
+        # 只改那一行数字，不重建页面（重建会把正在发信号的下拉删掉）
+        try:
+            if getattr(self, "_mem_count", None) is not None:
+                self._mem_count.setText(
+                    self._mem_count_text(len(getattr(ext, "history", []) or []), n))
+        except (RuntimeError, AttributeError):
+            pass
+
+    def _memory_rows(self, hist, keep=14):
+        """把历史条目拼成给人看的文字。
+
+        ⚠️ 历史里存的是 dict（`{"role":..,"content":..}`）。原来这里当成二元组解包，
+        而 dict 迭代出来是**键名** → 每条都显示成「[她] content」，一个字的正文都没有
+        （主人 2026-10-26 报的就是这个）。这里同时兼容老格式的元组。
+        """
+        rows = []
+        for item in list(hist or [])[-keep:]:
+            if isinstance(item, dict):
+                role = str(item.get("role") or "")
+                text = str(item.get("content") or "")
+            else:
+                try:
+                    role, text = item[0], item[1]
+                except (IndexError, TypeError):
+                    role, text = "", str(item)
+            who = "你" if role == "user" else "她"
+            rows.append(f"[{who}] {text}")
+        return "\n\n".join(rows)
+
+    def _peek_chat_memory(self):
+        ext = self._chat_ext()
+        hist = list(getattr(ext, "history", []) or []) if ext is not None else []
+        dlg = QDialog(self)
+        dlg.setWindowTitle("她记着的最近几条")
+        dlg.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        dlg.setModal(True)
+        dlg.resize(580, 440)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(16, 14, 16, 12)
+        lay.setSpacing(8)
+        ed = QPlainTextEdit()
+        ed.setReadOnly(True)
+        ed.setPlainText(self._memory_rows(hist) or "（还没聊过，她什么都不记得）")
+        lay.addWidget(ed, 1)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        btn = QPushButton("关掉")
+        btn.clicked.connect(dlg.accept)
+        row.addWidget(btn)
+        lay.addLayout(row)
+        dlg.open()          # 不用 exec()：非阻塞，脚本里也能验（exec 会卡住事件循环）
+
+    def _clear_chat_memory(self):
+        ext = self._chat_ext()
+        if ext is None:
+            return
+        try:
+            ext.clear_history()
+        except Exception:
+            pass
+        self.pet.say("忘干净了", seconds=2.4, again=True)
+        self._rebuild_page("chattune")
+
+    def _save_persona(self):
+        if not hasattr(self, "_persona_edit"):
+            return
+        from pet_ext import chat as cmod
+        text = self._persona_edit.toPlainText().strip()
+        # 和内置一字不差就当"没改"，省得以后默认人格升级了他还在用旧的
+        self.pet.cfg["chat_persona"] = "" if text == cmod.SYSTEM_PROMPT.strip() else text
+        try:
+            self.pet.save_config()
+        except Exception:
+            pass
+        self.pet.say("记住了，下次说话就用这个人格", seconds=3.0, again=True)
+
+    def _reset_persona(self):
+        from pet_ext import chat as cmod
+        if hasattr(self, "_persona_edit"):
+            self._persona_edit.setPlainText(cmod.SYSTEM_PROMPT.strip())
+        self.pet.cfg["chat_persona"] = ""
+        try:
+            self.pet.save_config()
+        except Exception:
+            pass
+
+    # ---------------- 派活 ----------------
+    def _dispatch_ext(self):
+        return (getattr(self.pet, "ext", None) or {}).get("dispatch")
+
+    def _page_dispatch(self, page):
+        """派活给谁：拖文件到桌宠身上时，浮窗上面那排按钮。"""
+        ext = self._dispatch_ext()
+        card = page.card("派活给谁", "拖文件到桌宠身上时，浮窗上面那排按钮", "ui.chat")
+        if ext is None:
+            page.hint(card, "派活模块没加载（pet_ext/dispatch.py）。")
+            return
+        for spec in ext.agent_specs():
+            self._agent_row(page, card, spec)
+        page.buttons(card, [
+            ("自动检测本机装了什么", self._auto_detect, "primary", None),
+            ("手动添加…", self._add_agent, None, None),
+        ], align_right=False)
+        # ⚠️ 检测结果紧跟在按钮下面（原来放在卡片最顶上，一点就把整张卡往下推，
+        # 看着像"说明自己跳到上面去了"—— 主人 2026-10-26 的原话）
+        msg = getattr(self, "_detect_msg", "")
+        if msg:
+            # 没找到的时候用醒目的橙色，别再用那行比正文还淡的小灰字
+            page.hint(card, msg, "warn" if msg.startswith("⚠️") else "faint")
+        page.hint(card, "关掉只是不出现在浮窗那排按钮里（配置还留着）；「删除」才是真删。")
+        page.hint(card, "「只打开」是内置的，始终排在最后：点了直接用系统默认程序打开文件，不用打指令。")
+
+        # —— 怎么配（直接写在界面上，省得去翻文档）——
+        tip = page.card("怎么配一个新的 Agent", "填三样东西就行", "page.rescue")
+        page.hint(tip, "· 命令：可执行名（比如 claude）或者完整路径（比如 D:////tools////pi.cmd）。"
+                       "填名字的话它必须在 PATH 里。")
+        page.hint(tip, "· 参数：照那个 CLI 自己的文档写。"
+                       "⚠️ 桌宠是把任务文字从标准输入（stdin）喂进去的，所以必须是"
+                       "「不给任务参数就从 stdin 读」的那种——"
+                       "codex exec ｜ claude -p ｜ dsh --profile headless - 都行。")
+        page.hint(tip, "· 额外目录参数：只有 codex 用得上（--add-dir，拖进来的文件跨目录时"
+                       "才需要），别的一般留空。")
+        page.hint(tip, "配完可以直接拖个文件试一次；跑不起来就看浮窗里的「打开输出文件」，"
+                       "报错基本都写在里面（多半是参数不对）。")
+        page.hint(tip, "自动检测只认参数确定的两个（Codex / DSH）；别的（Claude、Pi、Gemini、"
+                       "Aider…）用「手动添加…」自己填，填完会一直留着。")
+
+    def _agent_row(self, page, card, spec):
+        box = QWidget()
+        hb = QHBoxLayout(box)
+        hb.setContentsMargins(0, 0, 0, 0)
+        hb.setSpacing(6)
+        key = spec.get("key")
+        # ⚠️ Switch 的 toggled 带 bool，第一个参数就是它（别指望默认值）
+        sw = Switch(bool(spec.get("on", True)),
+                    lambda on, k=key: self._toggle_agent(k, on))
+        hb.addWidget(sw)
+        edit = QPushButton("编辑")
+        edit.setCursor(Qt.CursorShape.PointingHandCursor)
+        edit.clicked.connect(lambda _=False, k=key: self._edit_agent(k))
+        hb.addWidget(edit)
+        dele = QPushButton("删除")
+        dele.setCursor(Qt.CursorShape.PointingHandCursor)
+        dele.clicked.connect(lambda _=False, k=key: self._delete_agent(k))
+        hb.addWidget(dele)
+        cmdline = " ".join(x for x in (spec.get("cmd"), spec.get("args")) if x)
+        page.row(card, str(spec.get("label") or key), cmdline, box)
+
+    def _toggle_agent(self, key, on):
+        ext = self._dispatch_ext()
+        if ext is None:
+            return
+        specs = [dict(x) for x in ext.agent_specs()]
+        for spec in specs:
+            if spec.get("key") == key:
+                spec["on"] = bool(on)
+        ext.save_specs(specs)          # 开关不用重建页面，行还在
+
+    def _delete_agent(self, key):
+        ext = self._dispatch_ext()
+        if ext is None:
+            return
+        specs = [dict(x) for x in ext.agent_specs() if x.get("key") != key]
+        if not specs:
+            specs = []                 # 允许全删，只剩「只打开」
+        ext.save_specs(specs)
+        self._rebuild_page("dispatch")
+
+    def _edit_agent(self, key):
+        ext = self._dispatch_ext()
+        if ext is None:
+            return
+        specs = [dict(x) for x in ext.agent_specs()]
+        cur = next((x for x in specs if x.get("key") == key), None)
+        if cur is None:
+            return
+        from pet_ext import dispatch as dmod
+        dlg = AgentDialog(self, spec=cur, templates=None)
+        if dlg.exec() != QDialog.DialogCode.Accepted or dlg.result_spec is None:
+            return
+        new = dlg.result_spec
+        new["on"] = bool(cur.get("on", True))
+        new["key"] = key               # 改名字不改 key，别把"上次选的谁"弄丢
+        idx = specs.index(cur)
+        specs[idx] = new
+        ext.save_specs(specs)
+        self._rebuild_page("dispatch")
+
+    def _auto_detect(self):
+        """扫一遍本机，把找到的 Agent 直接加进列表，然后**弹窗报结果**。
+
+        主人 2026-10-26：「这个自动检测我根本不知道到底有没有检测到，提示太不明显了」。
+        页面上那行小灰字太不起眼，改成扫完直接弹一个对话框，找没找到、找在哪儿、
+        没找到该怎么办，全写在里面。
+        """
+        ext = self._dispatch_ext()
+        if ext is None:
+            return
+        specs = [dict(x) for x in ext.agent_specs()]
+        found, missed = ext.detect(specs)
+        if found:
+            specs.extend(found)
+            ext.save_specs(specs)
+        names = "、".join(x["label"] for x in found)
+        miss = "、".join(label for _k, label in missed)
+        if found and miss:
+            self._detect_msg = f"✅ 找到 {names}，已加进列表。没找到：{miss}（要的话手动添加）。"
+        elif found:
+            self._detect_msg = f"✅ 找到 {names}，已加进列表。"
+        elif miss:
+            self._detect_msg = (f"⚠️ 没找到 {miss}。装好了还找不到，就用「手动添加…」"
+                                f"把它的完整路径填进去。")
+        else:
+            self._detect_msg = "✅ 能认的都配好了。"
+        self._rebuild_page("dispatch")
+        self._show_detect_result(found, missed, specs)
+
+    def _show_detect_result(self, found, missed, existing=()):
+        """把检测结果摊开：哪些找到了（在哪个路径）、哪些已经在列表、哪些没找到。"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("自动检测结果")
+        dlg.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        dlg.setModal(True)
+        dlg.resize(620, 380)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(18, 16, 18, 14)
+        lay.setSpacing(10)
+
+        if found:
+            head = (f"✅ 检测到 {len(found)} 个，已经加进下面的列表："
+                    if not missed else
+                    f"✅ 检测到 {len(found)} 个，已经加进下面的列表（另有 {len(missed)} 个没找到）：")
+            head_label = QLabel(head)
+            head_label.setObjectName("cardTitle")
+        elif missed:
+            head_label = QLabel(f"⚠️ 一个都没检测到（试了 {len(missed)} 个）")
+            head_label.setObjectName("warn")
+        else:
+            head_label = QLabel("✅ 能认的都已经在列表里了，没有新的可加。")
+            head_label.setObjectName("cardTitle")
+        lay.addWidget(head_label)
+
+        ed = QPlainTextEdit()
+        ed.setReadOnly(True)
+        # 命令可能很长（DSH 是完整路径），所以**名字和命令分两行**，
+        # 一行一条的话后面那句"已经在列表里"会被挤到第二行折得很难看。
+        rows = []
+        for spec in found:
+            rows.append(f"✅ {spec.get('label') or spec.get('key')}")
+            rows.append(f"     {spec.get('cmd', '')}")
+            rows.append("     → 刚加进列表")
+        old_keys = {str(x.get("key") or "") for x in found}
+        for spec in existing:
+            key = str(spec.get("key") or "")
+            if key in old_keys:
+                continue
+            cmd = " ".join(x for x in (spec.get("cmd"), spec.get("args")) if x)
+            rows.append(f"✓  {spec.get('label') or key}")
+            rows.append(f"     {cmd}")
+            rows.append("     → 已经在列表里")
+        for _key, label in missed:
+            rows.append(f"❌ {label}")
+            rows.append("     没在 PATH / 默认安装位置找到")
+        if not rows:
+            rows.append("（没有任何可显示的条目）")
+        ed.setPlainText("\n".join(rows))
+        lay.addWidget(ed, 1)
+
+        tips = []
+        if missed:
+            tips.append("· 没找到的：装好了还认不出来，就点「手动添加…」把命令的完整路径填进去。")
+        tips.append("· 只认参数确定的那几个 CLI（Codex / DSH）；Pi、Gemini、Aider 这些用「手动添加…」。")
+        tips.append("· 加进去之后可以立刻拖个文件试一次；跑不起来就看浮窗里的「打开输出文件」。")
+        tip = QLabel("\n".join(tips))
+        tip.setObjectName("faint")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        ok = QPushButton("知道了")
+        ok.setDefault(True)
+        ok.setFixedHeight(32)
+        ok.clicked.connect(dlg.accept)
+        row.addWidget(ok)
+        lay.addLayout(row)
+        dlg.open()          # 非阻塞：按钮回调里 exec() 会把事件循环卡住（脚本也验不了）
+
+    def _add_agent(self):
+        ext = self._dispatch_ext()
+        if ext is None:
+            return
+        dlg = AgentDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted or dlg.result_spec is None:
+            return
+        new = dict(dlg.result_spec)
+        new.setdefault("on", True)
+        specs = [dict(x) for x in ext.agent_specs()]
+        base = str(new.get("key") or "agent")
+        key, n = base, 2
+        while any(x.get("key") == key for x in specs):
+            key = f"{base}{n}"
+            n += 1
+        new["key"] = key
+        specs.append(new)
+        ext.save_specs(specs)
+        self._rebuild_page("dispatch")
+
+    def _rebuild_page(self, key):
+        """整页重建（删/改 Agent 之后用）—— 页面本来只建一次，这里破个例。"""
+        page = self._pages.get(key)
+        builder = next((b for k, _t, _d, _i, b in self.PAGES if k == key), None)
+        if page is None or builder is None:
+            return
+        body = page.body
+        vbar = page.verticalScrollBar()
+        keep = vbar.value()            # 重建会弹回顶部，先记着滚到哪了
+        while body.count():
+            item = body.takeAt(0)
+            w = item.widget() if item is not None else None
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        # ⚠️ 必须把末尾那个 stretch 补回来：`takeAt(0)` 会连它一起抽走，而
+        # `Page.card()` 是 `insertWidget(count()-1, …)` —— 布局空了之后这个 -1
+        # 等于"追加到末尾"，于是第二张卡插到了第一张**前面**、整页上下颠倒
+        # （主人 2026-10-26：「点了自动检测，『怎么配一个新的 Agent』跑到最上面去了」）。
+        body.addStretch(1)
+        try:
+            page._index = []
+            page._segments = []
+        except AttributeError:
+            pass
+        getattr(self, builder)(page)
+        QTimer.singleShot(0, lambda: vbar.setValue(keep))
+
     # ---------------- 通用 ----------------
     def _page_general(self, page):
         pet = self.pet
@@ -3384,10 +4055,24 @@ class ConsoleWindow(QWidget):
             ("救急恢复", lambda: pet.force_recover(), None, "page.rescue"),
         ], align_right=False)
 
+        # 聊天入口：桌宠右上角那个小圆按钮（2026-10-26 主人要的"能关掉，只用菜单"）
+        # 标题里带上"聊天""圆圈"两个词：设置搜索是按标题+说明做子串匹配的，
+        # 主人 2026-10-26 说"找不到开关聊天圆圈 UI 的选项"，搜「聊天」只搜到"圆角"。
+        card = page.card("聊天入口", "想跟她说话的时候从哪儿进", "ui.chat")
+        page.row(card, "聊天圆圈（桌宠右上角那个圆）",
+                 "点一下就从圆长成聊天窗口；关掉就只剩右键菜单",
+                 Switch(bool(pet.cfg.get("chat_bubble", True)), pet.set_chat_bubble))
+        page.hint(card, "关掉之后桌宠身上不会多一个圆圈，"
+                        "只用右键菜单里的「和她聊聊…」。")
+
         card = page.card("开机", "", "page.power")
         page.row(card, "开机自启", "下次开机自己出来",
                  Switch(pet.cfg.get("autostart", False), pet.set_autostart))
         page.hint(card, "自启是在「启动」文件夹里放一个快捷方式，随时关得掉。")
+        # 改完代码不用手动关掉再双击脚本（主人 2026-10-26：「每一次都需要我重启应用」）
+        page.buttons(card, [("重启桌宠", lambda: pet.restart_pet(), None, "page.power")],
+                     align_right=False)
+        page.hint(card, "换完形象、改完设置想让它重新读一遍，点这个（约 3 秒自己回来）。")
 
         card = page.card("主题", "默认跟着 Windows 的亮暗走", "page.theme-system")
         seg = Segmented(THEME_MODES, self._mode, self.set_theme)

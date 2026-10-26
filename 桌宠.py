@@ -35,9 +35,9 @@ def load_config():
         }
 
 import requests
-from PySide6.QtCore import (Qt, QTimer, QPoint, QPointF, QRectF, QUrl, QIODevice,
+from PySide6.QtCore import (Qt, QTimer, QPoint, QPointF, QRect, QRectF, QUrl, QIODevice,
                             QEventLoop, QSize, QFileInfo, QEvent, QAbstractNativeEventFilter,
-                            QObject)
+                            QObject, QVariantAnimation, QEasingCurve, QAbstractAnimation)
 from PySide6.QtGui import (QPainter, QPixmap, QFont, QColor, QIcon, QFontMetrics,
                            QPolygonF, QImage, QCursor, QMouseEvent, QKeySequence)
 from PySide6.QtWidgets import (QApplication, QWidget, QMenu, QSystemTrayIcon,
@@ -244,6 +244,26 @@ def install_qt_translator(app):
 
 BUBBLE_H = 112         # 气泡区高度（要放得下四行余额气泡：余额 / 金额 / 今日已用 / 峰谷）
 MARGIN = 4
+
+# 闲着时会做的小动作。名字 → (显示名, 权重, 每帧衰减量)
+# 衰减量决定这个动作持续多久（50 帧/秒）：0.03 ≈ 0.66 秒。
+# 权重决定"随机做动作"时被抽中的比例（蹦跳最常见，拉伸最少见）。
+ACTION_DECAY_DEFAULT = 0.03
+# 闲着时会做的程序化小动作（灵动版形象不用这套，它的动作在 sprites_anim/ 里）。
+# 权重照搬 v1.1.5 原本写死在 _maybe_idle_action 里的那三档：35 / 25 / 10，
+# 加起来 70，正好对上"七成做动作、三成冒话"的老比例。
+# 名字、权重、衰减速度（最后一列，action_t 每帧减多少）。
+ACTIONS = {
+    "jump":    ("蹦跳",  35, 0.030),
+    "sway":    ("摇摆",  25, 0.030),
+    "stretch": ("拉伸",  10, 0.030),
+}
+# 这三个动作在右键「逗她一下」子菜单里的小图标（灵动版那份在 pet_ext/anim.py 的 CLIP_ICONS）
+ACTION_ICONS = {
+    "jump": "act.jump",         # 蹦跳 → 向上箭头
+    "sway": "act.sway",         # 摇摆 → 左右箭头
+    "stretch": "act.stretch",   # 拉伸 → 横向撑开
+}
 # 五档。**滑块上的百分比以「大」为 100%**（2026-09-14 定的：选「大」时滑块就停在 100%），
 # 所以这几档特意按"乘出来是整百分数"排：30% / 40% / 60% / 80% / 100%。
 SIZE_LEVELS = {"迷你": 0.27, "特小": 0.36, "小": 0.54, "中": 0.72, "大": 0.90}
@@ -269,6 +289,104 @@ def size_from_percent(pct):
     except (TypeError, ValueError):
         return SIZE_DEFAULT
 MIN_WIN_W = 168        # 窗口最窄宽度：小档位也别把气泡挤成一条（气泡要放得下三四行字）
+# 下面两个常量 2026-10-24 起已不再使用（窗口尺寸改成精确到像素），留着只作历史记录：
+# 曾经为了少重建窗口，拖滑块时把尺寸取整到 48px 一档。后来实测发现真正贵的是
+# setFixedSize（3~5ms/次），换 resize（0.14ms/次）之后取整就没意义了。
+WIN_RESIZE_STEP = 12
+WIN_RESIZE_STEP_DRAG = 48
+
+# 换动作时挪位置的参数。挂到屏幕边上播宽动作，鱼得往里挪一点。
+#
+# 2026-10-24 主人第三次提要求：「我不是要平移过去，我要的就是套用原本散步的
+# 动作然后衔接动作」；第四次又说「当前走路动作不明显，看起来像平移」。
+# 走路确实已经是散步那套（同一个 `move` 动作、同一个引擎）—— 问题在**速度**：
+# `move` 这段是"正面朝镜头走"，一个步态周期约 8 帧（≈3 步/秒）；
+# 按 320px/秒走，每一步要跨 100 多像素（半个身位），看着就是在冰上滑。
+# 现在降到 180px/秒，每步约 60~75px（约 1/4 身位），步子才看得出来。
+# 再慢更像"迈步"，但等得久；嫌慢就调这一个数。
+# 走位三段（`_build/convert_crab.py` 从「螃蟹走路」切出来的，见那边的说明）
+CRAB_IN = "crab_in"           # 原地转身：正面 → 侧身
+CRAB_LOOP = "crab"            # 侧身横着走（窗口在这段里平移）
+CRAB_OUT = "crab_out"         # 原地转回正面
+WALK_TURN_RATE = 2.2          # 转身那两段的播放倍速（原速 1.0 秒一段，太拖）
+
+WALK_SPEED = 180.0            # px/秒：任务走位的目标速度（散步的 SPEED 是 380）
+WALK_GAP = 12                 # 差不到这个距离就不值得走一趟，原地张开就行
+WALK_ARRIVE_EPS = 2.0         # 任务走位"到了"的判定半径（散步是 12px，那个太松，落点会偏）
+# 跟随鼠标：已经"边缘贴上光标"了就不再设目标（不然每帧重设、原地抖）。
+# 4px 够小 —— 主人要的是"贴上"，不是"离一段距离"。
+FOLLOW_DEAD = 4.0
+# 跟随鼠标：光标**压在鱼身上**（边缘外这么多也算贴着）时它就不动 ——
+# 不然光标在鱼身上挪一下，鱼就要跑半个身位去"贴边缘"，鼠标左右穿梭时来回抽搐
+# （主人 2026-10-25：「完全越过桌宠且离开后才向着鼠标前进」）。
+FOLLOW_SLACK_X = 8.0      # 光标**停住**后：边缘外这么点也算"还贴着"，别为 1px 抖来抖去
+FOLLOW_SLACK_Y = 16.0
+# 光标**还在动**的时候（150ms 内挪过）用更大的容忍范围：鼠标划过/穿过桌宠时它别追，
+# 不然就是"跟着鼠标一路蹭"（主人说的"慢慢拖动或快速穿梭，左右滑动会抽搐"）。
+FOLLOW_SLACK_MOVING = 60.0
+FOLLOW_MOVE_HOLD = 0.15   # 光标停稳这么久之后才按"贴紧"处理
+FOLLOW_DROP = 60.0        # 鱼挂在光标下方这么多（别把鼠标盖住）
+
+# 原地待着「跟着鼠标转」用 idle 里现成的帧段（2026-10-25）：
+# idle 241 帧的顺序就是 正面(1~70) → 看左(90~115) → 正面(126~145) → 看右(150~172) → 正面(186~241)。
+# 所以"从正面看左"可以顺着走过去，不用硬切 clip。
+STILL_LOOK_RANGE = {"left": (94, 110), "right": (150, 172)}     # 看那边时的**来回播**区间
+# 来回播的**节奏**：每一边的一个来回各占多少帧的时间（24fps）。
+# 主人 2026-10-26：「把帧数做到20帧就好，向左看摆动有点快」。
+# ⚠️ **不能真把看左扩到 20 帧**：那要拉到 91~110，幅度从 0.48x 回到 0.61x（主人说过大）。
+# 所以帧数还是 17，只是**放慢播**到"20 帧的时间"（rate = 17/20 = 0.85，一个来回 0.83 秒）。
+# 实际帧率变成 20.4fps —— 一段幅度很小的晃动，看不太出顿。
+STILL_HOLD_TARGET = {"left": 20, "right": 23}
+# ⚠️ 2026-10-26 第二十三轮：看左那段被主人连着退回两次，从 115 → 110 → 91 → **94**。
+# 主人的原话：「向左看的循环动画摇摆幅度大很多」→「还是偏大一点」→「还是向左看偏大，眼睛的幅度」。
+#
+# 量的过程（记下来，免得以后又从头摸）：
+#   区间          每帧运动  头相对身体偏移  皮肤重心  脸区两端差
+#   看右 150~172    1.00        1.00        1.00       1.00     ← 基准
+#   看左 90~115     1.25        1.64        1.47       1.24
+#   看左 90~110     1.05        1.20        0.87       0.96
+#   看左 91~110     0.99        1.06        0.61       0.89
+#   看左 94~110     0.97        0.90        0.48       0.84     ← 现在
+#
+# ⚠️ **别想着"把看右镜像过来当看左"**（主人 2026-10-26 提过这个办法，很自然，但不行）：
+# 角色**不对称** —— 围裙上的鲸鱼和字母、头饰的蕾丝和蝴蝶结、头发分缝都在特定一侧，
+# 镜像以后鲸鱼和字母会反过来（一眼假）。实测：任意一帧镜像后和原样的差是 **31~48**，
+# 而相邻帧才差 1~8；对比图 `_test/_video/mirror_compare.png`。
+# 更麻烦的是"翻"这个动作本身：只要在播的过程中切换镜像，那一下就是一次 30+ 的跳变，
+# 比现在的幅度问题明显得多。所以只能老老实实从 idle 里挑帧。
+# ⚠️ **根因是素材本身**：idle 的 90~115 名义上是"看左"，但整段都在**持续转头**（不是站定），
+# 所以任何子区间都带着转动；而 150~172 是真的站定。只能靠收窄区间来压，压到最后
+# 就是"取最平的那一小段"。94~110 是"皮肤重心"这条曲线上最平的一段里最长的一个。
+# ⚠️ 判据别再用"整只鱼重心漂移"：那个指标在 90~110 时就已经是 1.00x 了，
+# 但主人看着还是偏大 —— 人眼盯的是**头/眼睛相对身体转了多少**，不是整只鱼平移。
+# 111~115 没浪费 —— 当"转回正面 / 去右边"的起点用，路径仍然连续（接缝跳 0 帧）。
+# ⚠️ 2026-10-25 第二轮：这两段**不能循环播**。实测 90→115 首尾差 13.11，
+# 是段内相邻帧差（1.36）的 9.7 倍；150→172 是 8.0 倍 —— 循环回去就是每 1 秒画面跳一下
+# （主人说的「看向一边不是循环动画，有很明显的卡顿感」）。
+# 现在改成**来回播**（90→115→90→…，见 `_still_after_once`），每一帧都前后连续。
+# ⚠️ 2026-10-25 第二十一轮：**不再用固定起点表**。
+# 旧表 `STILL_TURN_CHAIN` 把每条的起点写死（正面→看左从 70 起、正面→看右从 130 起），
+# 待机停在哪一帧都得先跳过去 —— 实测 190→70 差 29.6、117→130 差 27.1（相邻帧只有 0.7~7.3），
+# 就是主人说的「鼠标从左到右的时候会跳帧，衔接不自然」。
+# 现在改成 `_still_plan()` 现场算：能从当前帧顺着走过去就顺着走（差 0），
+# 实在绕不开才跳，而且跳到**实测差最小**的那一帧。各落点的差都量过，写在函数里。
+# 连续绕路最多容忍多少帧。idle 是 **24fps、241 帧 ≈ 10 秒一圈**，绕半圈就是 5~9 秒
+# （实测 190 帧往后绕到 115 要 166 帧 = 6.9 秒）—— 那已经不是"反应慢"，是"没反应"。
+# 50 帧 ≈ 2.1 秒：正好是"它注意到光标、转过头来看你"的合理时长。
+STILL_TURN_MAX = 50
+
+# 下面这组是"只变宽、不挪位置"时的参数（原地张开 200ms）。
+GLIDE_SPEED = 430.0           # px/秒（现在只作兜底：没有走路动作时才会滑）
+GLIDE_MIN_MS = 220
+GLIDE_MAX_MS = 560
+
+# 拖大小滑块时"改窗口"的最小间隔（秒）。改一次窗口（setGeometry）要 4.2ms，
+# 而鼠标回报率可以是 125Hz 甚至 1000Hz —— 每次都改会把主线程占满
+# （1000 × 4.2ms = 完全卡死，这大概就是"拖起来一顿一顿"的根）。
+# 8ms 约等于 125Hz 鼠标的节奏，人眼在这个尺度上看不出尺寸是"连续"还是"每 8ms 一跳"。
+DRAG_RESIZE_GAP = 0.008
+# 但差值够大时立刻跟，别让窗口明显落在鼠标后面（快速拖动）
+DRAG_RESIZE_JUMP = 4
 
 # 语录（闲着时自己冒话）的触发频率档位
 # cooldown = 两句之间最少隔多少帧（20ms/帧）。"正常"就是原来的行为，其它档只动这个间隔。
@@ -282,7 +400,18 @@ LINE_FREQ_DEFAULT = "正常"
 SPEED = 380.0
 TICK = 20
 # 「原地待着时也跟着鼠标转」的"鼠标贴身上"半径：鼠标在这个圈里就当正面（不左右转）
+# ⚠️ 只给三视图 / 挂件用（它们按窗口中心算，圆半径对得上）。
+# 灵动版见下面那组 —— 窗口比鱼宽一倍多，按窗口算会让"光标还在鱼身上"就转头。
 STILL_FACE_NEAR = 70
+
+# ---- 灵动版「原地跟着鼠标转」的判定（2026-10-25 第二版，主人 240fps 录屏报"抽搐"）----
+# 旧版直接沿用上面的 70px（离**窗口中心**），但灵动版窗口宽度固定成最宽画布，
+# 鱼只占窗口的一半左右 —— 光标还在鱼身上、甚至离鱼还有一百多像素，就已经被判成
+# "在左边/右边"了。主人说的「鼠标重叠时无法判断」「鼠标在桌宠附近应该显示正面」
+# 都是这个。现在一律按**鱼身边缘**算，再往外留一段"旁边"。
+STILL_NEAR_PAD = 36         # 鱼身边缘再往外多远还算"在旁边" → 维持正面
+STILL_NEAR_HYST = 26        # 滞回带宽：侧着的时候收回"鱼身 + PAD - HYST"以内就回正面
+STILL_SWITCH_HOLD = 0.16    # 新方向要稳定这么久才真切（去抖，治来回抽搐）
 
 # ===== 它说话的调子 =====
 # 统一风格：俏皮、机灵、有点小得意也爱撒娇的少女；句子短、口语、（呀／嘛／啦／诶／哦）。
@@ -430,6 +559,14 @@ SOUND_TIP = ("点击音最适合 0.15 ~ 0.60 秒：\n"
              "· 太长（超过 0.60 秒）连点时会叠成一团、听着拖\n"
              "· 最稳的是 0.2 ~ 0.4 秒，干脆利落")
 
+# ===== 任务完成提示音（跟点击音**分开一套**，但同属「音效」大板块）=====
+# 主人 2026-10-24 的要求：别和点击音挤在同一个模块里；而且要和点击音一样
+# 能试听、能换成自己的，时长不设"最适合区间"那种限制（只挡掉 1 分钟以上的）。
+TASK_SOUNDS = {"叮": "notify-chime.wav"}      # 内置：名字 → assets 里的文件名
+TASK_SOUND_DEFAULT = "叮"
+TASK_SOUND_MAX_SEC = 60.0                     # 超过 1 分钟不收（提示音不该比任务还长）
+TASK_USER_DIR = os.path.join(USER_DIR, "sounds", "task")
+
 
 # ===== 音乐联动（QQ音乐 / 网易云音乐）=====
 # 这两个软件都会把"现在在放什么"登记到 Windows 的媒体会话里（SMTC），
@@ -518,6 +655,10 @@ MENU_ICONS = (
     ("查看余额", "nav.balance"),
     ("查看天气", "nav.weather"),
     ("看一眼", "ui.eye"),
+    ("和她聊聊", "ui.chat"),
+    # 「逗她一下」：用鼠标点她 / 逗她的意思，和「快速双击」同一个图案（pointer-click）。
+    # 2026-10-26 主人要求改名（它 → 她）并补上图标 —— 之前漏登记，展开后整条子菜单都没图标。
+    ("逗她一下", "page.click"),
     ("打开设置", "nav.general"),
     ("快速双击", "page.click"),
     ("说一句我写的台词", "ui.quote"),
@@ -924,9 +1065,14 @@ class ClickPlayer(QIODevice):
             self._voices = []
 
 
-# 形象：大肥鱼（三视图）/ 小鲸鱼挂件（单张 cut-out）
+# 形象：大肥鱼（三视图）/ 小鲸鱼挂件（单张 cut-out）/ 灵动大肥鱼（视频拆帧，带真动作）
 SKIN_PET = "大肥鱼"
 SKIN_WIDGET = "小鲸鱼挂件"
+SKIN_ANIM = "灵动大肥鱼"        # 走 pet_ext/anim.py，帧序列在 sprites_anim/
+# 灵动版的画框在原始素材里留了余量（舞狮要举高、走路要飘），按画面高度缩放的话，
+# 同一个大小档位下它看起来比三视图小一圈。实测待机时角色只占画框高度的 84.8%，
+# 所以身体区按倒数放大回去（1/0.848 ≈ 1.18），两者视觉大小才对得上。
+ANIM_BODY_ZOOM = 1.18
 WIDGET_SKIN_FILE = "small-whale.png"
 SPRITE_VIEWS = {"front": "正面", "side": "侧面", "back": "背面"}
 VIEW_LABELS = {"front": "正面（朝屏幕下）", "side": "侧面（左右走）",
@@ -3984,6 +4130,8 @@ class PetWindow(QWidget):
             "x": None,
             "y": None,
             "ds_api_key": "",
+            # 桌宠右上角那个圆形聊天按钮：关掉就只在右键菜单里「和她聊聊…」
+            "chat_bubble": True,
             "city": "汕头",
             "city_list": [],
             "balance_always": False,
@@ -4036,6 +4184,16 @@ class PetWindow(QWidget):
             "menu_debug": False,
             "custom_sounds": {},
             "still_face_cursor": False,
+            # 闲着做哪些小动作：这里列的是"被关掉"的动作名（见 ACTIONS）。
+            # 空列表 = 全都做；设置页「动作和互动 → 它会做什么」里勾选的就是它。
+            "actions_off": [],
+            # 任务完成通知：Codex / DSH 那边任务结束就弹一条系统通知（只报标题）
+            "task_notify_on": True,
+            # 通知来的时候响一声（跟着「音效」总开关和音量走）
+            "task_notify_sound": True,
+            # 提示音用哪一段：内置的「叮」，或主人自己加的（名字 → 见 TASK_SOUNDS）
+            "task_sound_set": TASK_SOUND_DEFAULT,
+            "task_sounds": {},
             "mem_skip_foreground": True,    # 百宝箱·回收内存：不动前台程序（防卡顿）
             # 设置窗口自己的样子（背景 / 标题 / 图标）。跟桌宠本体无关，
             # 全是 ui_console.BACKDROP_DEFAULTS 里那几个键，界面那边负责读写。
@@ -4090,6 +4248,8 @@ class PetWindow(QWidget):
             self._hotkey_bridge = HotkeyBridge(self)
             _app.installNativeEventFilter(self._hotkey_bridge)
         self.setMouseTracking(True)      # 菜单开着时要靠这个收鼠标移动消息（见 _forward_mouse_to_menu）
+        # 收拖放（P6 派活）：文件拖到桌宠身上 → pet_ext/dispatch.py 接
+        self.setAcceptDrops(True)
         self.setWindowTitle("大肥鱼桌宠")
         
         # 精灵加载（三视图 + 挂件，每一张都可以被用户自定义图片替换）
@@ -4101,15 +4261,21 @@ class PetWindow(QWidget):
         self.icon = QIcon(os.path.join(SPRITE_DIR, "icon.png"))
 
         self.skin = self.cfg.get("skin", SKIN_PET)
-        if self.skin not in (SKIN_PET, SKIN_WIDGET) or (self.skin == SKIN_WIDGET
-                                                        and not self._has_sprite("挂件")):
+        if self.skin == SKIN_ANIM:
+            # 灵动版靠 sprites_anim/ 里的帧序列，素材不在就先按三视图显示
+            if not os.path.isdir(os.path.join(APP_DIR, "sprites_anim")):
+                self.skin = SKIN_PET
+        elif self.skin not in (SKIN_PET, SKIN_WIDGET) or (
+                self.skin == SKIN_WIDGET and not self._has_sprite("挂件")):
             self.skin = SKIN_PET
+        self.cfg["skin"] = self.skin
 
         self.cfg["size"] = self._clamp_size(self.cfg["size"])
         self.cur_h = int(340 * self.cfg["size"])
         # 老配置里存的是无级调节调出来的高度（不在五档上）时，得把那个高度的精灵补上，
         # 否则第一帧就没图可画
         self._ensure_sprites(self.cur_h)
+
         self._apply_window_size()
 
         # 状态
@@ -4121,10 +4287,24 @@ class PetWindow(QWidget):
         self.target = None
         self.rest_until = 0
         self.cur_speed = 0.0
+        # 散步 / 跟随时的"走路动画"状态：None / "in"（原地转身）/ "walk"（横着走）/ "out"（转回正面）
+        # 和 `_walk_phase`（"去那儿做动作"那一趟）是两套，互不干扰。
+        self._amb_phase = None
+        self._amb_t0 = 0.0
+        self._still_side = None      # 原地待着跟鼠标转："left" / "right" / None
+        self._still_chain = None     # 转头过渡还要接着播的帧段
+        self._still_want = None      # 去抖用：还没确认的新方向（稳 0.16 秒才提交）
+        self._still_want_t = 0.0     # 上面那个方向是什么时候开始要的
+        self._still_ping = 1         # 看那边时的来回播方向：1 正着 / -1 倒着
+        self._follow_last_cursor = None   # 跟随：上一次的光标位置 / 移动时间
+        self._follow_move_at = 0.0          # 进入当前阶段的时间（in/out 卡住时兜底重置）
         self.prev_key = None
         self.cross_t = 0.0
         self.action = None
         self.action_t = 0.0
+        # 动作衰减速度（每帧减多少）：决定一个动作持续多久，默认 0.03 ≈ 0.66 秒。
+        # 具体值在 play_action() 里按动作挑（ACTIONS 第三列）。
+        self._action_decay = ACTION_DECAY_DEFAULT
         self.bubble_text = ""
         self.bubble_until = 0
         self.bubble_inner = False
@@ -4304,6 +4484,11 @@ class PetWindow(QWidget):
             if _s_path and os.path.exists(_s_path):
                 self._custom_sounds[_s_name] = _s_path
                 self._click_clips[_s_name] = _s_path
+        # 任务完成提示音：自己一套（sounds/task/），和上面的点击音效互不相干
+        self._custom_task_sounds = {}
+        for _t_name, _t_path in (self.cfg.get("task_sounds") or {}).items():
+            if _t_path and os.path.exists(_t_path):
+                self._custom_task_sounds[_t_name] = _t_path
         # 常开音频流（首选）：设备一直是醒的，点下去立刻出声、开头不会被吞
         self._click_player = None
         if AUDIO_AVAILABLE:
@@ -4433,6 +4618,17 @@ class PetWindow(QWidget):
         self.hover_timer = QTimer(self)
         self.hover_timer.timeout.connect(self._menu_tick)
         self.hover_timer.start(MENU_HOVER_MS)
+
+        # ---------- 扩展功能挂载 ----------
+        # 新功能一律放 pet_ext/ 里，通过 setup(pet) 挂上来；上面那些原有逻辑一行不动。
+        # 任何一个扩展加载失败都只打一行日志，不影响桌宠本体启动。
+        self.ext = {}
+        try:
+            from pet_ext import load_extensions
+            self.ext = load_extensions(self)
+        except Exception as _ext_exc:
+            print(f"[ext] 扩展加载失败（不影响桌宠本体）: {_ext_exc}")
+
 
     # ---------- 音乐联动 ----------
     def poll_music(self):
@@ -5279,12 +5475,147 @@ class PetWindow(QWidget):
         self.sound_on = bool(on)
         self.cfg["sound_on"] = bool(on)
 
+    def set_task_notify_sound(self, on):
+        """任务完成提示音（「叮」一声）的开关。
+
+        跟全局 `sound_on` 是**两级**：总开关关掉什么都不响；这个只关提示音，
+        气泡照旧。主人 2026-10-24 要求"设置里能自己开关"。
+
+        放哪还没定死 —— 现在挂在「设置 → 音效」页，等设置界面重构时可能挪到
+        「通知」那一类里去。所以这里只做"改一个配置项 + 落盘"，不掺 UI 逻辑。
+        """
+        self.cfg["task_notify_sound"] = bool(on)
+        if bool(on) and bool(getattr(self, "sound_on", True)):
+            try:
+                ext = getattr(self, "ext", {}).get("notify")
+                if ext is not None:
+                    ext._play_chime()      # 打开时当场响一声，让人知道是哪个音
+            except Exception:
+                pass
+
     def set_sound_set(self, name):
         if name not in self._sound_names():
             return
         self.sound_set = name
         self.cfg["sound_set"] = name
         self.play_click()          # 换音效顺手试听一声
+
+    # ---------- 任务完成提示音（独立一套，和点击音效分开）----------
+    # 主人 2026-10-24 的要求：
+    #   "任务音效不要与点击音效放在同一个模块里，可统一归到音效大板块下；
+    #    任务音效也要具备同样的试听与自定义能力，且不限制时长（太长的要 pass，
+    #    比如 1 分钟以上），由用户自行设置。"
+    # 所以这一段和上面 `_sound_names` / `_add_sound_from_path` 那套**互不相干**：
+    # 自己的配置键（`task_sound_set` / `task_sounds`）、自己的目录（sounds/task/）、
+    # 自己的时长规则（只挡 60 秒以上，不要求"最适合区间"）。
+    def task_sound_names(self):
+        """可选提示音名单：内置「叮」+ 主人自己加的（自己加的排在后面）。"""
+        extra = [n for n in getattr(self, "_custom_task_sounds", {}) if n not in TASK_SOUNDS]
+        return list(TASK_SOUNDS) + extra
+
+    def task_sound_path(self, name=None):
+        """当前提示音的 wav 路径；没有 / 文件丢了就退回内置那一声。"""
+        name = name or self.cfg.get("task_sound_set") or TASK_SOUND_DEFAULT
+        if name in TASK_SOUNDS:
+            return os.path.join(ASSET_DIR, TASK_SOUNDS[name])
+        path = getattr(self, "_custom_task_sounds", {}).get(name) or ""
+        if path and os.path.exists(path):
+            return path
+        return os.path.join(ASSET_DIR, TASK_SOUNDS[TASK_SOUND_DEFAULT])
+
+    def set_task_sound_set(self, name):
+        if name not in self.task_sound_names():
+            return
+        self.cfg["task_sound_set"] = name
+        self.preview_task_sound()          # 换音效顺手试听一声
+
+    def preview_task_sound(self):
+        """试听当前提示音 —— 不受"关掉提示音"影响（主人点了试听就该出声）。"""
+        ext = getattr(self, "ext", {}).get("notify")
+        if ext is None:
+            return
+        try:
+            ext._play_chime(force=True)
+        except Exception as exc:
+            print("[sound] 试听提示音失败:", exc)
+
+    def _register_task_sound(self, name, path):
+        if not hasattr(self, "_custom_task_sounds"):
+            self._custom_task_sounds = {}
+        self._custom_task_sounds[name] = path
+        self.cfg["task_sounds"] = dict(self._custom_task_sounds)
+
+    def add_task_sound_dialog(self):
+        """挑一个自己的音频当任务提示音：转成单声道 44.1k，1 分钟以上不收。"""
+        with self._ui_guard():
+            path, _ = QFileDialog.getOpenFileName(
+                self, "挑一个提示音（wav）", "", "WAV 音频 (*.wav);;所有文件 (*)")
+        if not path:
+            return
+        if not path.lower().endswith(".wav"):
+            with self._ui_guard():
+                QMessageBox.information(
+                    self, "要 wav 格式",
+                    "提示音现在只吃 wav 格式。\n\n"
+                    "可以先用任意工具把它转成 WAV（16 位最好）再选一次。"
+                    "长度随意，1 分钟以内都行。")
+            return
+        secs = wav_seconds(path)
+        if secs and secs > TASK_SOUND_MAX_SEC:
+            with self._ui_guard():
+                QMessageBox.information(
+                    self, "这个太长了",
+                    f"这段有 {secs:.1f} 秒，超过 {TASK_SOUND_MAX_SEC:.0f} 秒了。\n\n"
+                    "提示音是「任务干完了」的一声提醒，太长会盖住别的声音，\n"
+                    "建议换成 5 秒以内的（截一段出来就行）。")
+            return
+        base = (os.path.splitext(os.path.basename(path))[0] or "我的提示音").strip()[:16]
+        base = base or "我的提示音"
+        if base in TASK_SOUNDS:                # 别和内置的重名
+            base += "（我的）"
+        dest = os.path.join(TASK_USER_DIR, base + ".wav")
+        try:
+            os.makedirs(TASK_USER_DIR, exist_ok=True)
+            real, note = make_click_wav(path, dest, max_seconds=None)
+        except Exception as exc:
+            with self._ui_guard():
+                QMessageBox.warning(
+                    self, "这个文件我处理不了",
+                    f"{exc}\n\n建议先转成 WAV（16 位、44100Hz）再试。")
+            return
+        self._register_task_sound(base, dest)
+        self.set_task_sound_set(base)
+        self.say(f"提示音换成「{base}」啦：{real:.2f} 秒" + (f"（{note}）" if note else ""))
+
+    def remove_task_sound_dialog(self):
+        """删掉自己加的提示音（内置那声「叮」动不了）。"""
+        names = [n for n in getattr(self, "_custom_task_sounds", {}) if n not in TASK_SOUNDS]
+        if not names:
+            self.say("你还没加过自己的提示音呢")
+            return
+        with self._ui_guard():
+            pick, ok = QInputDialog.getItem(
+                self, "删掉我加的提示音", "选一个删掉（内置的动不了）：", names, 0, False,
+                Qt.WindowType.WindowStaysOnTopHint)
+        if not ok or not pick:
+            return
+        self._remove_task_sound(pick)
+        self.say(f"提示音「{pick}」删掉了")
+        self.preview_task_sound()
+
+    def _remove_task_sound(self, pick):
+        path = getattr(self, "_custom_task_sounds", {}).pop(pick, None)
+        try:
+            (self.cfg.get("task_sounds") or {}).pop(pick, None)
+        except Exception:
+            pass
+        if self.cfg.get("task_sound_set") == pick:      # 删的正是当前用的 → 退回内置
+            self.cfg["task_sound_set"] = TASK_SOUND_DEFAULT
+        if path:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
 
     # ---------- 自己加音效 ----------
     def _sound_names(self):
@@ -5920,7 +6251,7 @@ class PetWindow(QWidget):
                  if kind in SKIN_KIND_LABELS else "已恢复自带形象（上传过的还在「我的形象库」里）")
 
     def set_skin(self, name):
-        """切换形象：大肥鱼（三视图）/ 小鲸鱼挂件（单张）。"""
+        """切换形象：大肥鱼（三视图）/ 小鲸鱼挂件（单张）/ 灵动大肥鱼（带动作）。"""
         if name == SKIN_WIDGET and not self.widget_skin_ok:
             self.say("小鲸鱼形象没找到图片")
             return
@@ -5928,9 +6259,31 @@ class PetWindow(QWidget):
         self.cfg["skin"] = name
         self.prev_key = None
         self.cross_t = 0.0
+        self._amb_phase = None      # 切形象：散步/跟随那套走路状态作废
+        self._still_side = None     # 原地转头状态也作废
+        self._still_chain = None
+        # 灵动版拖滑块时不建三视图精灵（见 set_size），所以切回三视图 / 挂件时
+        # 得在这里把当前高度的精灵补回来，不然绘制会找不到图。
+        if name != SKIN_ANIM:
+            self._ensure_sprites(self.cur_h)
+            self._prune_sprites(self.cur_h)
+        # 灵动版的身体区比三视图高一点（ANIM_BODY_ZOOM），窗口会跟着变高。
+        # 变高时保持"脚底和中心不动"，否则切过去它整只会往下出溜一截。
+        old_x, old_y = self.x(), self.y()
+        old_w, old_h = self.width(), self.height()
         self._apply_window_size()
+        if old_w:
+            self.move(int(old_x + old_w / 2 - self.width() / 2),
+                      int(old_y + old_h - self.height()))
         self._settle()
         self.update()
+        # 灵动版：切过去就开始播待机，切走就把帧动画停掉
+        _anim = getattr(self, "ext", {}).get("anim")
+        if _anim is not None:
+            try:
+                _anim.on_skin_changed()
+            except Exception as exc:
+                print("[anim] 切换形象后同步失败:", exc)
 
     # ---------- 吸附 / 翻转 ----------
     def _snap_to_edge(self):
@@ -5947,22 +6300,58 @@ class PetWindow(QWidget):
                        else "bottom" if cy > geo.bottom() - geo.height() / 4 else None)
         self._settle(geo)
 
+    def _content_w(self):
+        """鱼在窗口里**实际画出来的宽度**（灵动版按当前动作的画布比例算）。
+
+        2026-10-25：窗口宽度固定成最宽画布之后，窗口比窄动作宽出一截，
+        贴边吸附要是还按窗口宽度算，鱼就会离屏幕边 170 多像素。
+        """
+        if self.skin == SKIN_ANIM:
+            try:
+                mw, mh = self.ext["anim"].player.canvas_size()
+                return float(mw) * self._body_h() / max(1, mh)
+            except Exception:
+                pass
+        return float(self.width())
+
+    def _content_margin(self):
+        """窗口左右两侧的透明留白（鱼居中，所以两边一样）。"""
+        return max(0.0, (self.width() - self._content_w()) / 2.0)
+
+    def _canvas_to_content_w(self, canvas):
+        """把某段动作的画布尺寸换算成"鱼在那段里画出来有多宽"。
+
+        窗口宽度 2026-10-25 起固定成最宽画布，**不再代表鱼有多宽** ——
+        判断"贴边换动作要不要走位"必须用鱼身宽度，否则目标点会被窗口宽度夹住，
+        走位刚起步就到，看着就是"走位只放了几帧"。
+        """
+        try:
+            mw, mh = canvas
+            return float(mw) * self._body_h() / max(1, mh)
+        except Exception:
+            return self._content_w()
+
     def _settle(self, geo=None):
         if not self.snap_on or (self.snap_h is None and self.snap_v is None):
             return
+        # 跟随鼠标时不做吸附（2026-10-25 多屏）：它得跟着光标走，
+        # 一吸就被拽回屏幕边 —— 光标到了副屏，它会被一直吸在原屏的边上过不去。
+        if self.mode == "follow":
+            return
         geo = geo or (self.screen() or QApplication.primaryScreen()).availableGeometry()
         x, y = self.x(), self.y()
+        m = self._content_margin()      # 贴边贴的是"鱼"的边，不是窗口的边
         if self.snap_h == "left":
-            x = geo.left()
+            x = geo.left() - m
         elif self.snap_h == "right":
-            x = geo.right() - self.width() + 1
+            x = geo.right() - self.width() + 1 + m
         if self.snap_v == "top":
             y = geo.top()
         elif self.snap_v == "bottom":
             y = geo.bottom() - self.height() + 1
         # 吸附轴已经是精确贴边，只有没吸附的轴才需要钳制在屏幕内
         if self.snap_h is None:
-            x = max(geo.left(), min(geo.right() - self.width(), x))
+            x = max(geo.left() - m, min(geo.right() - self.width() + 1 + m, x))
         if self.snap_v is None:
             y = max(geo.top(), min(geo.bottom() - self.height(), y))
         self.flip_x = bool(self.flip_on_left and self.snap_h == "left")
@@ -6092,11 +6481,16 @@ class PetWindow(QWidget):
         scale = breath
         jump = -abs(math.sin(self.jump_t * 3.14159)) * 14 * self.jump_t if self.jump_t > 0 else 0
         act_rot = act_sx = act_sy = 0.0
-        if self.action == "sway":
-            act_rot = math.sin(self.action_t * 3.14159 * 2) * 10 * self.action_t
-        elif self.action == "stretch":
-            act_sy = 0.06 * math.sin(self.action_t * 3.14159)
-            act_sx = -0.03 * math.sin(self.action_t * 3.14159)
+        a = self.action_t          # 1 → 0 的衰减进度
+        if a > 0:
+            # 全部是纯算术：paintEvent 是 50 帧/秒的热路径，这里不许查表、读文件、拼字符串
+            if self.action == "sway":
+                act_rot = math.sin(a * 3.14159 * 2) * 10 * a
+            elif self.action == "stretch":
+                act_sy = 0.06 * math.sin(a * 3.14159)
+                act_sx = -0.03 * math.sin(a * 3.14159)
+            # 2026-10-23：shake / squish / lean / nod / doze 这五个是当天的临时试验，
+            # 主人看过说不要，已删。三视图只保留原本的蹦跳 / 摇摆 / 拉伸。
 
         # 按压 Q 弹：底部坐标不变，横向撑开、纵向压扁
         press_sx = 1 + 0.13 * self.press_t
@@ -6106,11 +6500,15 @@ class PetWindow(QWidget):
             if key is None:
                 return
             name, h, facing = key
-            pix = self.sprites[(name, h)]
+            pix = self.sprites.get((name, h))
+            if pix is None:
+                return              # 这种高度还没缩出来（切形象那一瞬），这一帧先不画，别崩
             ph = pix.height() * scale * (1 + act_sy) * press_sy
             pw = pix.width() * scale * (1 + act_sx) * press_sx
             dx = cx - pw / 2
-            bottom = BUBBLE_H + MARGIN + self.cur_h
+            # 脚底贴窗口下沿（原来是从顶算 BUBBLE_H+MARGIN+cur_h，精确尺寸下两者相等；
+            # 拖动中窗口会大一点点，贴下沿才不会让桌宠跟着上下抖）
+            bottom = self.height() - MARGIN - 10
             dy = bottom - ph + jump + bob
             p.save()
             p.setOpacity(opacity)
@@ -6126,10 +6524,58 @@ class PetWindow(QWidget):
             p.restore()
 
         cur_key = self._sprite_key()
-        if self.cross_t > 0:
+        anim_pix = None
+        anim_next = None
+        anim_blend = 0.0
+        if self.skin == SKIN_ANIM:
+            # 灵动版：动作全由 pet_ext/anim.py 的帧序列负责，这里只负责把它画上去
+            _pl = getattr(getattr(self, "ext", {}).get("anim"), "player", None)
+            if _pl is not None:
+                anim_pix, anim_next, anim_blend = _pl.draw_state()
+
+        if anim_pix is not None:
+            # 帧可能还是按旧高度缓存的（改大小后正在后台重排），这里统一缩到目标高度。
+            # 所以拖滑块时画面立刻就是新尺寸，不用等那一批帧重排完。
+            #
+            # ⚠️ 这里**不加呼吸缩放、不加待机摇摆、不加走路上下颠**：
+            # 那些动作视频里本来就有，再套一层等于每帧都被重采样一次（1.02 倍 + 1.5°），
+            # 实测清晰度直接掉 31%（拉普拉斯方差 5644 → 3911），画面会一直发糊。
+            # 只保留"按压 Q 弹"和"蹦跳"这两个视频里没有的交互反馈。
+            th = self._body_h()
+            k = th / max(1, anim_pix.height())
+            ph = th * press_sy
+            pw = anim_pix.width() * k * press_sx
+            adx = cx - pw / 2
+            abottom = self.height() - MARGIN - 10        # 同三视图：贴窗口下沿
+            # 每段素材的构图基线不一样（「大口吃零食」坐着吃，脚底比别的段低 15px）。
+            # manifest 里每段的 dy 把它拉回同一条地平线；按当前缩放换算，
+            # 切动作时由 _anim_dy_now() 在 0.22 秒里渐变过去，不会硬跳。
+            #
+            # ⚠️ **不加 `jump`**（程序化蹦跳那 14px）：灵动版素材自己就有蹦跳，
+            # 再叠一层就是"上下抽动"（主人 2026-10-25 报的）。三视图那条分支照旧加。
+            ady = abottom - ph + self._anim_dy_now() * th / 384.0
+            p.save()
+            # 左吸附的整体翻转（flip_x）和"走路朝哪边"（_walk_flip）叠加：
+            # 「螃蟹走路」素材是朝左走的，往右就镜像，不然会看着倒着走。
+            if bool(self.flip_x) != bool(getattr(self, "_walk_flip", False)):
+                p.translate(cx, 0)
+                p.scale(-1, 1)
+                p.translate(-cx, 0)
+            p.drawPixmap(QRectF(adx, ady, pw, ph), anim_pix,
+                         QRectF(0, 0, anim_pix.width(), anim_pix.height()))
+            if anim_next is not None and anim_blend > 0.0:
+                # 只在 ANIM_SUBFRAMES=2 时启用：拿相邻两帧交叉淡入，视觉上 48fps
+                p.setOpacity(anim_blend)
+                p.drawPixmap(QRectF(adx, ady, pw, ph), anim_next,
+                             QRectF(0, 0, anim_next.width(), anim_next.height()))
+            p.restore()
+        # ⚠️ 灵动版**绝不能**进这两个分支：`anim_pix is None`（切区间的那一瞬间）
+        # 时它会画出三视图的精灵图 —— 那就是「闪一帧别的鱼」。
+        # 宁可这一帧什么都不画，也不能画错的图。
+        elif self.skin != SKIN_ANIM and self.cross_t > 0:
             draw_one(self.prev_key, self.cross_t)
             draw_one(cur_key, 1.0 - self.cross_t)
-        else:
+        elif self.skin != SKIN_ANIM:
             draw_one(cur_key, 1.0)
 
     def _bubble_top(self, bh):
@@ -6439,6 +6885,116 @@ class PetWindow(QWidget):
         if facing is not None and facing != self.facing:
             self.facing = facing
 
+    def _all_screens_geo(self):
+        """所有屏幕可用区的**并集**（多屏走路时用）。
+
+        只用来保证"别跑到所有屏幕外面"，不限制在单块屏内。
+        """
+        rect = None
+        try:
+            for s in QApplication.screens():
+                g = s.availableGeometry()
+                rect = g if rect is None else rect.united(g)
+        except Exception:
+            rect = None
+        if rect is None or rect.isEmpty():
+            return (self.screen() or QApplication.primaryScreen()).availableGeometry()
+        return rect
+
+    def _move_geo(self):
+        """走一步时用来夹屏的屏幕可用区。
+
+        2026-10-25（主人报了多屏走不过去）：跟随鼠标时用**所有屏幕的并集**。
+        试过两种"单块屏"的写法，都不行：
+
+        - 按**自己所在那块屏**：窗口永远被夹在这块屏里，光标一到副屏就走不动，
+          表现是"顶着屏幕边缘原地踏步"（主人报的就是这个）；
+        - 按**光标那块屏**：窗口一上来就被夹进目标屏 —— 从副屏左边往右走，
+          会被 `max(geo.left()...)` 一把拽进去一百多像素，看着是"瞬移"。
+
+        并集的唯一副作用是 L 形排列时可能走到两屏之间的空白（窗口本来就是
+        半透明的，看不见），换来的是跨屏能平滑走过去。
+        非跟随模式（散步 / 去那儿做动作 / 吸附）还是按自己那块屏，行为不变。
+        """
+        if self.mode == "follow":
+            return self._all_screens_geo()
+        return (self.screen() or QApplication.primaryScreen()).availableGeometry()
+
+    def _console_open(self):
+        """设置窗口是不是开着。
+
+        开着就别跟着鼠标跑 —— 桌宠会一路追到设置窗口上面挡住要点的东西
+        （主人 2026-10-25 报的）。注意它和右键菜单不是一回事：
+        菜单走 `ui_open`（整只站住），设置窗口是独立窗口，得单独判。
+        """
+        win = getattr(self, "_console", None)
+        if win is None:
+            return False
+        try:
+            return bool(win.isVisible()) and not bool(win.isMinimized())
+        except RuntimeError:          # 窗口对象已经被 Qt 收掉了
+            return False
+
+    def _follow_target(self, cursor, geo):
+        """跟随鼠标的目标点。规则（2026-10-25 主人定）：
+
+        - 光标**压在鱼身上**（左右各半个鱼宽 + 一点余量）→ **不动**。
+          以前是"永远让边缘贴光标"，光标在身上挪一下，鱼就要跑半个身位去贴，
+          鼠标慢慢拖或快速左右穿梭时就是来回抽搐。
+        - 光标**离开鱼身**之后才追，追到"鱼的边缘贴上光标"。
+        - 两个轴分开判断：只有水平要动就纯水平走，只有垂直要动就纯垂直走，
+          不会因为垂直差一点就斜着蹭。
+
+        返回 None = 现在这样就挺好，别动。
+        """
+        fw = 0.0
+        try:
+            fw = self._canvas_to_content_w(self.ext["anim"].player.clip_canvas("idle"))
+        except Exception:
+            fw = 0.0
+        if fw <= 1:
+            fw = self._content_w()
+        cx_now = self.x() + self.width() / 2.0
+        cy_now = self.y() + self.height() / 2.0
+
+        # 光标是不是还在动？（150ms 内挪过就算"在动"）
+        now = time.perf_counter()
+        last = getattr(self, "_follow_last_cursor", None)
+        if last is None or last[0] != cursor.x() or last[1] != cursor.y():
+            self._follow_last_cursor = (cursor.x(), cursor.y())
+            self._follow_move_at = now
+        moving = (now - getattr(self, "_follow_move_at", 0.0)) < FOLLOW_MOVE_HOLD
+        slack_x = FOLLOW_SLACK_MOVING if moving else FOLLOW_SLACK_X
+        slack_y = FOLLOW_SLACK_MOVING if moving else FOLLOW_SLACK_Y
+
+        # 水平：压在鱼身上（光标还在动时范围更大）就不动；离开才让**边缘**贴上去
+        rel_x = cursor.x() - cx_now
+        if abs(rel_x) <= fw / 2.0 + slack_x:
+            tx = None
+        else:
+            tx = cursor.x() + fw / 2.0 if rel_x < 0 else cursor.x() - fw / 2.0
+
+        # 垂直：鱼挂在光标下方 FOLLOW_DROP，差得不多也别动
+        rel_y = (cursor.y() + FOLLOW_DROP) - cy_now
+        if abs(rel_y) <= slack_y:
+            ty = None
+        else:
+            ty = cursor.y() + FOLLOW_DROP
+
+        if tx is None and ty is None:
+            return None
+        dx = 0.0 if tx is None else tx - cx_now
+        dy = 0.0 if ty is None else ty - cy_now
+        if abs(dx) < 1.0 and abs(dy) < 1.0:
+            return None
+        tx = cx_now + dx
+        ty = cy_now + dy
+        # 水平按**鱼**夹（窗口两侧透明留白可以探出屏幕，跟 `_settle` 一致）
+        tx = max(geo.left() + fw / 2.0, min(geo.right() - fw / 2.0, tx))
+        half_h = self.height() / 2.0
+        ty = max(geo.top() + half_h, min(geo.bottom() - half_h, ty))
+        return (tx, ty)
+
     def _face_travel(self, dx, dy, ratio=2):
         """按"这一步往哪走"给朝向（dx/dy 是窗口中心 → 目标点的位移）。
 
@@ -6454,6 +7010,8 @@ class PetWindow(QWidget):
         ratio 只给"走路"用；跟着鼠标转头用的是 1（见 `_face_cursor`）——鼠标是看着走的，
         45 度就该算侧面，不该按宽屏那套偏袒横向。
         """
+        # 灵动版的散步/跟随：这一步开始走（或方向变了）就换成「螃蟹走路」（2026-10-25）
+        self._amb_sync_walk(dx)
         if abs(dx) >= ratio * abs(dy):
             self._set_dir("left" if dx < 0 else "right", 1 if dx < 0 else -1)
         elif dy < 0:
@@ -6586,7 +7144,8 @@ class PetWindow(QWidget):
         if self.cross_t > 0:
             self.cross_t = max(0.0, self.cross_t - 0.15)
         if self.action_t > 0:
-            self.action_t = max(0.0, self.action_t - 0.03)
+            # 时长按动作定（ACTIONS 第三列），目前三个动作都是 0.03
+            self.action_t = max(0.0, self.action_t - self._action_decay)
             if self.action_t == 0:
                 self.action = None
 
@@ -6602,20 +7161,48 @@ class PetWindow(QWidget):
             return
         now_ms = self.t * self.tick_ms
 
-        if self.mode == "follow":
-            cursor = self.cursor().pos()
-            screen = QApplication.screenAt(cursor) or self.screen() or QApplication.primaryScreen()
-            geo = screen.availableGeometry()
-            near = (self.x() - 100 <= cursor.x() <= self.x() + self.width() + 100 and
-                    self.y() - 100 <= cursor.y() <= self.y() + self.height() + 100)
-            if near:
+        # 兜底：这一趟（"去那儿再做动作"）还在走，目标却被别的逻辑清掉了
+        # （切模式 / 跟随判定 / 散步休息）—— 就当作到位，把动作放出来。
+        # 不然 `_anim_walking` 一直立着：窗口永远窄、换动作也永远不重排。
+        if (self.target is None and getattr(self, "_walk_task", None)
+                and getattr(self, "_walk_phase", None) == "walk"):
+            # 只在"横着走"那一段兜底。转身（in）/ 转回正面（out）这两段本来就没有
+            # 目标点，不排除的话下一帧就把整趟掐了 —— 实测踩了两次（crab_out 只播 30ms）。
+            self._on_walk_arrived()
+
+        # 这一趟"去那儿做动作"在走的话，除了散步/跟随，谁也别改 target
+        has_task = getattr(self, "_walk_task", None) is not None
+
+        if self.mode == "follow" and not has_task:
+            if self._console_open():
+                # 设置窗口开着：站着别跟着鼠标跑（挡住设置就没法点了）
                 self.target = None
+                if getattr(self, "_amb_phase", None) in ("in", "walk"):
+                    self._amb_walk_stop()
             else:
-                # 目标点按"窗口中心"算，并且夹在可达范围内，否则贴边时会永远够不到
-                half_w, half_h = self.width() / 2, self.height() / 2
-                tx = max(geo.left() + half_w, min(geo.right() - half_w, cursor.x()))
-                ty = max(geo.top() + half_h, min(geo.bottom() - half_h, cursor.y() + 60))
-                self.target = (tx, ty)
+                cursor = self.cursor().pos()
+                screen = QApplication.screenAt(cursor) or self.screen() or QApplication.primaryScreen()
+                geo = screen.availableGeometry()
+                self.target = self._follow_target(cursor, geo)
+                # 到位就**当场**转身（2026-10-25 主人：「到达鼠标的位置时会在原地跑一会
+                # 才停下」——`crab` 是走路循环，不转就一直原地播）。
+                # 反过来，转身（约 0.5 秒）期间鼠标又动了也别干等，直接切回横着走 ——
+                # 不然就是"卡一下"。代价是那一帧会跳一下，比站着不动强。
+                if self.target is None:
+                    if getattr(self, "_amb_phase", None) == "walk":
+                        self._amb_walk_stop()
+                elif getattr(self, "_amb_phase", None) == "out":
+                    # 打断转身要"真的走了"才算（>8px）：死区是 4px，光标在边上抖一点点
+                    # 也会让 target 一帧有一帧没有，那样转身永远被打断（实测卡在 out 不动）。
+                    dx = self.target[0] - (self.x() + self.width() / 2)
+                    dy = self.target[1] - (self.y() + self.height() / 2)
+                    if (dx * dx + dy * dy) ** 0.5 > 8:
+                        _pl = getattr(getattr(self, "ext", {}).get("anim"), "player", None)
+                        if _pl is not None and _pl.play(CRAB_LOOP, loop=True, restart=True):
+                            self._amb_phase = "walk"
+                            self._amb_t0 = time.perf_counter()
+                        else:
+                            self._amb_phase = None
         elif self.mode == "wander":
             if self.target is None:
                 if now_ms < self.rest_until:
@@ -6630,12 +7217,20 @@ class PetWindow(QWidget):
         else:
             # 原地待着：一直维持正面形象，不再转头看鼠标、也不会背过身
             # （拖动过程中的朝向逻辑照旧走 mouseMoveEvent，不受这里影响）
-            self._still_face_front()
-            self._maybe_idle_action()
-            self.update()
-            return
+            #
+            # 例外（2026-10-24）：如果设了 `self.target` —— 也就是"去那个位置再做动作"
+            # （见 `_anim_walk_to_clip`）—— 就照散步那套走过去。跟随模式有任务时也走这条，
+            # 因为上面那个 follow 分支被 has_task 挡住了（不然每帧都会被鼠标位置覆盖）。
+            if self.target is None:
+                self._still_face_front()
+                self._maybe_idle_action()
+                self.update()
+                return
 
         if self.target is not None:
+            # "去那儿做动作"这一趟要求精确落点：走不动（贴边 / 被挡）也算到位，
+            # 否则动作会永远等在这儿。
+            task = getattr(self, "_walk_task", None)
             # 卡住保护：有目标却几乎没挪窝（比如贴着屏幕边），2 秒就换个目标
             moved = abs(self.x() - self._last_pos[0]) + abs(self.y() - self._last_pos[1])
             self._last_pos = (self.x(), self.y())
@@ -6645,28 +7240,74 @@ class PetWindow(QWidget):
                 self.target = None
                 self.rest_until = self.t * self.tick_ms + random.randint(2000, 6000)
                 self._set_dir("down")
+                self._on_walk_arrived()
                 self.update()
                 return
 
             cx, cy = self.x() + self.width() / 2, self.y() + self.height() / 2
             dx, dy = self.target[0] - cx, self.target[1] - cy
             dist = (dx * dx + dy * dy) ** 0.5
-            if dist < 12:
+            # 散步时 12px 就算到了（免得在目标点附近来回蹭）；去那儿做动作要踩准，
+            # 但靠"步长夹到剩余距离"保证不会冲过头再往回拉 —— 那个来回正是抽搐。
+            eps = WALK_ARRIVE_EPS if task else 12
+            # 跟随鼠标要贴得准：12px 的松弛量会留下"看得见的一道缝"（实测差 6.6px）。
+            # 跟 `_follow_target` 的死亡区一致，不抖也不留缝。
+            if not task and self.mode == "follow":
+                eps = FOLLOW_DEAD
+            if dist < eps:
                 self.target = None
                 self.rest_until = self.t * self.tick_ms + random.randint(8000, 18000)
                 self._set_dir("down")
+                self._on_walk_arrived()
             else:
                 step = self.cur_speed * self.tick_ms / 1000.0
+                if task:
+                    step = min(step, dist)      # 精确落点：最后一步刚好走到，不越过
+                # 散步/跟随的「原地转身 / 转回正面」那两段：窗口先站住别挪。
+                # 不这么拦就是"滑着转圈" —— 侧身还没转出来，整只鱼已经平移过去了（实测 150px 里滑掉 140）。
+                # 但只拦 1.2 秒（素材一段 0.63s）：再长说明回调丢了，宁可继续走也别冻住。
+                if (not task and getattr(self, "_amb_phase", None) in ("in", "out")
+                        and time.perf_counter() - getattr(self, "_amb_t0", 0.0) < 1.2):
+                    step = 0.0
                 nx, ny = cx + dx / dist * step, cy + dy / dist * step
-                # 整个窗口都要留在屏幕内，否则气泡会被顶出屏幕
-                geo = (self.screen() or QApplication.primaryScreen()).availableGeometry()
-                mx = max(geo.left(), min(geo.right() - self.width() + 1, int(nx - self.width() / 2)))
-                my = max(geo.top(), min(geo.bottom() - self.height() + 1, int(ny - self.height() / 2)))
-                self.move(mx, my)
-                self._face_travel(dx, dy)
+                # 整个窗口都要留在屏幕内，否则气泡会被顶出屏幕。
+                # 跟随鼠标跨屏时这是**光标那块屏**（见 `_move_geo`）——
+                # 用自己那块屏的话窗口会被夹在原地，永远走不到副屏。
+                geo = self._move_geo()
+                want_x = int(nx - self.width() / 2)
+                want_y = int(ny - self.height() / 2)
+                cm = self._content_margin()      # 夹的是鱼不是窗口
+                # ⚠️ 2026-10-25：必须取整再比/move。`cm` 是浮点（例 crab 183 宽 →
+                # 留白 121.5），夹出来的 `mx` 也是浮点 495.5；而 `self.x()` 是整数 495，
+                # 两者永远不相等 —— 下面那条"到边了算到位"就永远不触发，
+                # 每个 tick 都 move(495.5) 被 Qt 截成 495，窗口一动不动，
+                # 硬等 2 秒卡住保护（`_stuck_ticks > 100`）才收尾。
+                # 主人报的「往回跑时顶着屏幕边缘原地踏步」就是它。
+                mx = int(round(max(geo.left() - cm,
+                                   min(geo.right() - self.width() + 1 + cm, want_x))))
+                my = int(round(max(geo.top(),
+                                   min(geo.bottom() - self.height() + 1, want_y))))
+                # "想去的位置被屏幕夹住了，而且夹完还停在原地" = 到边了，直接算到位。
+                # 必须同时满足两条：只看 mx == self.x() 会把"刚起步、这一步还是 0px"误判成到边
+                # （转速从 0 开始，第一步就是不动的）；只看 want_x != mx 又会在边缘蹭。
+                if task and mx == self.x() and my == self.y() and (
+                        want_x != mx or want_y != my):
+                    # 不这么判的话会一直"想走但走不动"，白等 2 秒卡住保护
+                    # （实测贴边回程每次都多等 2 秒）
+                    self.target = None
+                    self._set_dir("down")
+                    self._on_walk_arrived()
+                else:
+                    self.move(mx, my)
+                    self._face_travel(dx, dy)
             if random.random() < 0.002 and self.jump_t == 0:
                 self.jump_t = 0.5
-        target_speed = SPEED if self.target is not None else 0.0
+        if self.target is None:
+            target_speed = 0.0
+        elif getattr(self, "_walk_task", None):
+            target_speed = WALK_SPEED      # 任务走位稍微慢一点（主人说不用很快）
+        else:
+            target_speed = SPEED
         self.cur_speed += (target_speed - self.cur_speed) * 0.3
         self.update()
 
@@ -7046,18 +7687,62 @@ class PetWindow(QWidget):
           - **没有背影**：鼠标跑到上方也只是正面，绝不背过身去
 
         「原地待着」默认不做这个动作（固定正面），只有挂件形象 + 菜单里那条开关打开时才会。
+
+        灵动版走另一条路（`_anim_face_cursor`）：它的窗口比鱼宽一倍多，死区必须按鱼身算。
         """
         if self.dragging or self.target is not None:
             return
         cursor = self.cursor().pos()
         dx = cursor.x() - (self.x() + self.width() / 2)
         dy = cursor.y() - (self.y() + self.height() / 2)
+        # 灵动版没有"侧面待机"的素材，`_set_dir` 对它完全没作用 —— 主人 2026-10-25 报
+        # 「灵动模式下原地模式没办法跟随鼠标转动了，那个开关没用了」就是这里。
+        # 用 idle 里现成的"看左 / 看右"两段当侧身站姿（见 `_anim_still_side`）。
+        if self.skin == SKIN_ANIM:
+            self._anim_face_cursor(dx, dy)
+            return
         if dx * dx + dy * dy <= STILL_FACE_NEAR * STILL_FACE_NEAR:
             self._set_dir("down", 1)                 # 贴身上：正对
         elif abs(dx) >= abs(dy):                     # 偏左右：按左右转
             self._set_dir("left" if dx < 0 else "right", 1 if dx < 0 else -1)
         else:                                        # 偏上下：正对（不背过身）
             self._set_dir("down", 1)
+
+    def _anim_face_cursor(self, dx, dy):
+        """灵动版：光标相对**鱼身中心**的位置 → 该看哪边。
+
+        三个数字（文件头那组常量），都是为了治主人报的「抽搐 / 重叠时判断不了」：
+          1. 死区按**鱼的半宽**算 —— 窗口比鱼宽得多，按窗口算会"光标还在鱼身上就转头"；
+          2. 滞回 —— 侧着时比正面时收得近一些，光标停在边界上不会来回切；
+          3. 去抖 —— 新方向要稳定 STILL_SWITCH_HOLD 才真切，手抖/慢拖不再一通乱转。
+        """
+        # 按**待机**那段的鱼宽算（不能跟当前动作走：水枪那类画布 689 宽，
+        # 播它的时候死区会突然涨一倍，光标在远处也被当成"在身上"）
+        try:
+            half = max(24.0, self._canvas_to_content_w(
+                self.ext["anim"].clip_canvas("idle")) / 2.0)
+        except Exception:
+            half = max(24.0, self._content_w() / 2.0)
+        cur = getattr(self, "_still_side", None)
+        # 进 / 出用不同的门限：已经侧着的时候，收回到"鱼身 + PAD - HYST"就回正面
+        pad = STILL_NEAR_PAD if cur is None else (STILL_NEAR_PAD - STILL_NEAR_HYST)
+        want = None
+        if abs(dx) > half + pad and abs(dx) >= abs(dy):
+            want = "left" if dx < 0 else "right"
+
+        now = time.perf_counter()
+        if want != getattr(self, "_still_want", None):
+            self._still_want = want
+            self._still_want_t = now
+        if want == cur:
+            self._anim_still_side(cur)      # 没变：只确保画面还停在正确的段上
+            return
+        if now - getattr(self, "_still_want_t", 0.0) < STILL_SWITCH_HOLD:
+            return                          # 还没稳，先不动（这就是去抖）
+        # 提交：dir / facing 跟着走（切回三视图时朝向不会怪）
+        self._set_dir("down" if want is None else want,
+                      1 if want != "right" else -1)
+        self._anim_still_side(want)
 
     def _still_face_front(self):
         """「原地待着」模式的朝向：默认一直维持正面（三维外观给正面，挂件也不左右翻面）。
@@ -7075,19 +7760,377 @@ class PetWindow(QWidget):
         if self.dir != "down" or self.facing != 1:
             self._set_dir("down", 1)
 
+    def _anim_still_side(self, side):
+        """灵动版「原地待着 + 跟着鼠标转」：用 idle 里现成的帧段，**带过渡**。
+
+        `idle` 那 241 帧本来就是"正面 → 看左 → 正面 → 看右"的顺序，所以切过去可以是
+        "转头"而不是硬切一帧（主人 2026-10-25：「太生硬了，过渡一下，中间帧也加上」）。
+
+        **具体从哪一帧起播不写死** —— 由 `_still_plan()` 按当前帧现场算（见那边的表）。
+        这里只负责三件事：状态没变就别打断、正在播一次性动作就只记状态、换方向时把
+        规划出来的第一段放出去（后面的段交给 `_still_after_once` 接力）。
+
+        `side` 取 "left" / "right" / None（None = 正对着你）。
+        """
+        if self.skin != SKIN_ANIM:
+            return
+        _anim = getattr(self, "ext", {}).get("anim")
+        if _anim is None:
+            return
+        pl = _anim.player
+        if "idle" not in (pl.manifest.get("clips") or {}):
+            return
+        old = getattr(self, "_still_side", None)
+        if pl.clip != "idle" and side != old:
+            # 正在播一次性动作（点了动作 / 通知挥手）：**只记状态，不动画面**。
+            # 动作播完 `_anim_after_once` 会按新的 `_still_side` 接回来；
+            # 这里要是直接切 idle，动作刚起个头就被顶掉了。
+            self._still_side = side
+            self._still_chain = None
+            return
+        if side == old:
+            # 过渡链还在播：别打断（下一帧就会进来，一打断就永远只剩循环段，
+            # 看着还是硬切 —— 实测踩过）
+            if getattr(self, "_still_chain", None):
+                return
+            # 状态没变，但画面可能被别的动作（点了个动作 / 通知挥手）顶掉了。
+            # ⚠️ 正在播一次性动作时**别插手**：播完 `_anim_after_once` 会自己转回这边
+            # （不然每 tick 都给它切回 idle，动作刚起个头就没了）。
+            if pl.clip != "idle":
+                return
+            # 过渡段 / 来回播的某一段正在播（loop=False）→ **别插手**，
+            # 播完 `_still_after_once` 会接力。这里要是重播，画面直接从第 0 帧跳。
+            if pl._range is not None and not pl.loop:
+                return
+            rng = STILL_LOOK_RANGE.get(side)
+            if rng:
+                if pl._range != rng:
+                    # 被顶掉了就重新开始来回播（正向起）
+                    self._still_ping = 1
+                    pl.play_range("idle", rng[0], rng[1], loop=False, step=1,
+                                  rate=self._still_hold_rate(side))
+            elif pl._range is not None or not pl.loop:
+                # 正面 = **整段 idle 循环**。⚠️ 别只调 `pl.play("idle", loop=True)`：
+                # clip 相同时它 restart=False 就直接 return，`_range` 还停在过渡段、
+                # `loop` 还是 False、定时器也停了 → 画面**永久定格**在过渡段最后一帧。
+                # 主人 240fps 录屏里"9 秒几乎不动、每 0.24 秒跳一帧"就是它（正面回不去）。
+                #
+                # 也不能用 `play(restart=True)`：它会通知桌宠重排窗口，转头时窗口尺寸
+                # 其实没变，白折腾一趟 = 画面「整体错位一下」（主人 2026-10-25 报的）。
+                last = pl.idx
+                pl.replay_silent("idle", loop=True)
+                pl.seek(last)
+            return
+        self._still_side = side
+        self._still_ping = 1        # 每次换方向都从正向开始播
+        chain = self._still_plan(old, side, pl)
+        if not chain:
+            # 算不出路径（老素材 / 意外组合）：直接给目标段
+            rng = STILL_LOOK_RANGE.get(side)
+            if rng:
+                pl.play_range("idle", rng[0], rng[1], loop=False, step=1)
+            else:
+                pl.replay_silent("idle", loop=True)
+            return
+        # 链式过渡（现在规划器每条只给一段，留着是为了以后加"绕两段"的路径）
+        self._still_chain = [tuple(s) for s in chain[1:]]
+        r0, r1, step = chain[0]
+        pl.play_range("idle", r0, r1, loop=False, step=step)
+
+    @staticmethod
+    def _still_plan(old, side, pl):
+        """从**当前帧**转到 `side` 要依次播哪些帧段：`[(起, 止, 方向), ...]`。
+
+        `idle` 241 帧的顺序：正面 1~70 → 转左 71~89 → 看左 90~115 → 转回 116~125
+        → 正面 126~145 → 转右 146~149 → 看右 150~172 → 转回 173~185 → 正面 186~241。
+        （241→1 是唯一的闭环接缝，帧差 6.80 和相邻帧一个量级 —— 但一圈 10 秒，
+        实际用不上，别想着靠它"绕过去"。）
+
+        规则：**能顺着走就顺着走，绕不开才跳，跳就跳实测差最小的那一帧。**
+        帧差实测（相邻帧基线 0.7~7.3，所以 >10 就是肉眼可见的一下）：
+          190→70  29.6   190→130 18.9   117→130 27.1   ← 旧版固定起点踩的坑
+          190→145 19.9   150→145 11.1   172→145 17.8   ← "看左"往 145 跳
+          1~70 →126 19.0（全区间 19~20）  ← 比跳 145（33.4）/ 186（31.0）好一大截
+          正面段内部：1→20 13.3、116→130 28.2、173→200 28.2（同是正面也不便宜，别乱跳）
+
+        ⚠️ **别想着"绕一圈"**：idle 是 24fps / 241 帧 ≈ 10 秒一圈，从 190 绕到 115 要
+        166 帧 = 6.9 秒。跳一下（差 20 左右）比"六秒后才转头"好得多。
+        ⚠️ **也别想着镜像**：素材不对称，mirror(172) 和真正的 115 差 29.6（自检 48.9），
+        镜像过来等于另一次硬跳。
+
+        `old`（上一次看哪边）现在**不参与判断** —— 状态和画面可能错位（点动作 / 被通知
+        挥手顶掉过），按 old 硬走反而会跳。留着这个参数是为了调用处读起来清楚
+        （"从 old 转到 side"），以后真要按来路区分再说。
+        """
+        cur = int(getattr(pl, "idx", 0) or 0)
+        l0, l1 = STILL_LOOK_RANGE["left"]        # (90, 115)
+        r0_, r1_ = STILL_LOOK_RANGE["right"]     # (150, 172)
+
+        if side == "left":
+            if 71 <= cur <= l1:                  # 已经在转左 / 正看着左边 → 顺着走到 115
+                return [(cur, l1, 1)]
+            if l1 < cur <= 145:                  # 左边后面那段正面 → **倒着**转回来（"转回去"的倒放）
+                return [(l1, cur, -1)]
+            if 1 <= cur <= 70:                   # 左边前面那段正面
+                if l1 - cur <= STILL_TURN_MAX:   # 走得到就顺着走
+                    return [(cur, l1, 1)]
+                return [(70, l1, 1)]             # 太远：跳到 70（差 13.1~14.6，最便宜的一档）
+            # 146~241（看右 + 右边那段正面）：倒着走会先"往右转"再"往左转"，不行。
+            # 落在 145 附近（146~198）跳 145 更省（差 11~24）；再往后 70 更省（差 ≤24）。
+            if cur <= 198:
+                return [(l1, 145, -1)]           # 跳到 145，再倒着转到 115
+            return [(70, l1, 1)]                 # 跳到 70，再顺着转到 115
+
+        if side == "right":
+            if 71 <= cur <= r1_:                 # 转左/看左/两段正面/转右 → 顺着走到 172
+                return [(cur, r1_, 1)]
+            if r1_ < cur <= 241:                 # 右边后面那段正面 → **倒着**转回右边
+                return [(r1_, cur, -1)]
+            # 1~70：绕过去要 3.5 秒以上，跳 126（右转弯前面那帧）只要差 19~20，
+            # 再顺着 126→172（1.9 秒）走过去 —— 这是全表里最划算的一条。
+            return [(126, r1_, 1)]
+
+        # ---- 回正面 ----
+        # **只看当前帧，不看 old**：状态和画面可能错位（点了动作 / 被别的动作顶掉过），
+        # 按 old 硬走会从 124 跳到 150（差 26）。规则：
+        #   - 正在"转出去"（71~89 / 146~149）→ **原地倒着转回来**。别硬把这一趟转完，
+        #     那要再等 0.5~1 秒，观感是"它没理你"；倒放就是"转回来"，一帧都不跳。
+        #   - 看左 / 转回（90~145）→ 顺着走到 145（转回正面那段正好收在这儿）
+        #   - 看右 / 转回（150~190）→ 顺着走到 190
+        #   - 其余（两头的正面段）→ **就地从当前帧接回整段循环**：待机素材本来就会
+        #     自己东张西望，不用为"回正面"再走一段路（走 30→70 要 1.7 秒，纯属白等）。
+        if 71 <= cur < l0:
+            return [(70, cur, -1)]
+        if 146 <= cur < r0_:
+            return [(145, cur, -1)]
+        if l0 <= cur <= 145:
+            return [(cur, 145, 1)]
+        if r0_ <= cur <= 190:
+            return [(cur, 190, 1)]
+        return [(cur, cur, 1)]               # 空转一段，收尾时 seek 回原帧接着循环
+
+    @staticmethod
+    def _still_hold_rate(side):
+        """来回播的倍速：把这一段的帧数摊到 STILL_HOLD_TARGET 那么长的时间里。
+
+        现在看左 17 帧 / 目标 20 帧 → 0.85（放慢），一个来回 0.83 秒。
+        看右 23 帧 / 目标 23 帧 → 1.0（原速）。
+        """
+        rng = STILL_LOOK_RANGE.get(side)
+        want = STILL_HOLD_TARGET.get(side)
+        if not rng or not want:
+            return 1.0
+        n = rng[1] - rng[0] + 1
+        return max(0.25, min(4.0, n / float(want)))
+
+    def _still_after_once(self, clip):
+        """原地转头过渡段的接力。返回 True = 这一段我接手了。
+
+        两种收尾：
+          - 看那边（side 非空）→ **来回播** `STILL_LOOK_RANGE` 那一段
+            （正着播完倒着播，倒着播完正着播）。不能直接循环：那段素材首尾差
+            是相邻帧的 9~10 倍，循环回去会"跳一下"，主人说的卡顿感就是这个。
+          - 转回正面（side 为空）→ 接着过渡段最后一帧往整段 idle 里播（`seek`），
+            不是从第 0 帧重来（145→1 会跳）。
+        """
+        chain = getattr(self, "_still_chain", None)
+        if not chain and clip != "idle":
+            return False                # 别的一次性动作收尾，跟转头无关
+        _anim = getattr(self, "ext", {}).get("anim")
+        pl = getattr(_anim, "player", None)
+        if pl is None:
+            self._still_chain = None
+            return False
+        if chain:
+            r0, r1, step = chain[0]
+            self._still_chain = [tuple(s) for s in chain[1:]] or None
+            pl.play_range("idle", r0, r1, loop=False, step=step)
+            return True
+        # 链播完了
+        side = getattr(self, "_still_side", None)
+        rng = STILL_LOOK_RANGE.get(side)
+        if rng:
+            ping = -getattr(self, "_still_ping", 1)      # 反向
+            self._still_ping = ping
+            pl.play_range("idle", rng[0], rng[1], loop=False, step=ping,
+                          rate=self._still_hold_rate(side))
+            return True
+        if side is None:
+            # 回正面：接上过渡段的最后一帧，继续整段 idle 循环。
+            # 用 silent 版 —— `play(restart=True)` 会通知桌宠重排窗口，而这里尺寸没变，
+            # 白折腾一趟就是「整体错位一下」。
+            last = pl.idx
+            pl.replay_silent("idle", loop=True)
+            pl.seek(last)
+            return True
+        return False
+
+    def _clear_still_side(self):
+        """退出「原地跟鼠标转」：回正面待机。"""
+        if getattr(self, "_still_side", None) is None:
+            return
+        self._still_side = None
+        self._still_chain = None
+        self._still_want = None
+        _anim = getattr(self, "ext", {}).get("anim")
+        if _anim is not None:
+            try:
+                _anim.player.play("idle", loop=True, restart=True)
+            except Exception:
+                pass
+
+    def play_action(self, key):
+        """做一个指定动作。空闲随机、菜单「逗她一下」、设置页的预览按钮都走这里。
+
+        名字不认识就直接返回，不抛异常 —— 以后加动作漏登记也不至于崩。
+        """
+        info = ACTIONS.get(key)
+        if info is None:
+            return
+        if key in (self.cfg.get("actions_off") or ()):
+            return                      # 主人把这一条关掉了
+        if key == "jump":
+            # 蹦跳走的是 jump_t 那套（衰减速度在 tick 里固定 0.06），和 action_t 无关
+            self.jump_t = 1.0
+            return
+        self.action, self.action_t = key, 1.0
+        self._action_decay = info[2]
+
+    def _tease(self):
+        """「逗她一下」：灵动版播一段真动作，三视图 / 挂件走程序化小动作。"""
+        if self.skin == SKIN_ANIM:
+            _anim = getattr(self, "ext", {}).get("anim")
+            if _anim is not None:
+                pool = _anim.once_clips()
+                if pool:
+                    clip = random.choice(pool)
+                    # 别在这里绕回 _play_anim_clip：它失败时会回调 _tease，会无限递归
+                    if self._anim_walk_to_clip(clip, loop=False) or _anim.play_once(clip):
+                        return
+        self._play_idle_action()
+
+    def _play_anim_clip(self, clip):
+        """灵动版：点名播某一段动作（右键二级菜单里点的）。
+
+        播不了（素材缺 / 不是灵动版）就退回"随机来一个"，不让菜单点了没反应。
+        """
+        _anim = getattr(self, "ext", {}).get("anim")
+        if _anim is None:
+            self._tease()
+            return
+        # 这段动作比待机宽、鱼又贴在屏幕边 → 先播走路挪过去，到了再播
+        if self._anim_walk_to_clip(clip, loop=False):
+            return
+        if _anim.play_once(clip):
+            return
+        self._tease()
+
+    def open_chat(self):
+        """右键「和她聊聊…」：打开侧边浮窗，接上 DeepSeek 聊天（`pet_ext/chat.py`）。
+
+        聊天走 API、任务走 Agent —— 两条通道分开（主人定的），这里只走 API 那条。
+        """
+        ext = (getattr(self, "ext", {}) or {}).get("chat")
+        if ext is None:
+            self.say("聊天模块没加载起来（pet_ext/chat.py）", seconds=4.0, again=True)
+            return
+        ext.open()
+
+    def _add_tease_menu(self, m):
+        """「逗她一下」的二级菜单：第一项是随机，后面按当前形象列能做的动作。
+
+        - 灵动版：列素材里真正有的一次性动作（`pet_ext/anim.py` 的 CLIP_LABELS）
+        - 三视图 / 挂件：列 ACTIONS 里的程序化小动作，被主人关掉的置灰但留着，
+          这样"为什么它不做这个动作"能一眼看出来，而不是从菜单里凭空消失
+        """
+        sub = m.addMenu("逗她一下")
+        sub.addAction("随机来一个", self._tease)
+        entries = []
+
+        if self.skin == SKIN_ANIM:
+            _anim = getattr(self, "ext", {}).get("anim")
+            if _anim is not None:
+                entries = [(label, lambda c=clip: self._play_anim_clip(c), True)
+                           for label, clip in _anim.once_choices()]
+        else:
+            off = self.cfg.get("actions_off") or ()
+            entries = [(label, lambda k=key: self.play_action(k), key not in off)
+                       for key, (label, _w, _d) in ACTIONS.items()]
+
+        if entries:
+            sub.addSeparator()
+        for label, cb, enabled in entries:
+            act = sub.addAction(label, cb)
+            if not enabled:
+                act.setText(f"{label}（已关闭）")
+                act.setEnabled(False)
+        return sub
+
+    def _anim_after_once(self, clip):
+        """灵动版的一次性动作播完了 → 回到待机（或走路）。
+
+        要挪回"家"的话（刚才是为了放宽动作才往里挤的），这一段也走回去 ——
+        所以播完不会"啪"一下瞬移回原位，而是自己走回去再站定。
+
+        开头先问一句 `_walk_after_once`：走位的"转身 → 走 → 转回正面"三段就是靠
+        这里接力的（每段都是 loop=False，播完就会进来）。
+        """
+        if self._walk_after_once(clip):
+            return
+        if self._amb_after_once(clip):
+            return
+        if self._still_after_once(clip):
+            return
+        # 停在"看左/看右"时，任何一次性动作播完都该回到那边，别回正面
+        if getattr(self, "_still_side", None) is not None:
+            rng = STILL_LOOK_RANGE.get(self._still_side)
+            _pl = getattr(getattr(self, "ext", {}).get("anim"), "player", None)
+            if rng and _pl is not None:
+                _pl.play_range("idle", rng[0], rng[1], loop=True)
+            return
+        _anim = getattr(self, "ext", {}).get("anim")
+        if _anim is None:
+            return
+        walking = self.target is not None
+        # 散步/跟随：走路要用「螃蟹走路」，不是正面 `move`（2026-10-25 主人要求的）
+        if (walking and self.mode in ("wander", "follow")
+                and getattr(self, "_walk_task", None) is None):
+            self._amb_walk_start()
+            return
+        want = "move" if walking else "idle"
+        if self._anim_walk_to_clip(want, loop=True):
+            return
+        _anim.player.play(want, loop=True)
+
+    def _play_idle_action(self):
+        """闲着时随机来一个：按 ACTIONS 的权重抽，跳过主人关掉的。"""
+        off = self.cfg.get("actions_off") or ()
+        pool = [(k, v[1]) for k, v in ACTIONS.items() if k not in off]
+        if not pool:
+            return
+        total = sum(w for _k, w in pool)
+        r = random.uniform(0.0, total)
+        acc = 0.0
+        for key, w in pool:
+            acc += w
+            if r <= acc:
+                self.play_action(key)
+                return
+        self.play_action(pool[-1][0])
+
     def _maybe_idle_action(self):
+        # 灵动版：待机动作由帧动画自己循环播，不走程序化小动作
+        if self.skin == SKIN_ANIM:
+            return
         # 闲着时的"小动作"概率固定 0.03；发呆时说什么、说多勤由主人选的「语录频率」决定
         # （安静 / 正常 / 话多 / 话痨，见 LINE_FREQ_LEVELS）
         preset = LINE_FREQ_LEVELS.get(getattr(self, "line_freq", LINE_FREQ_DEFAULT),
                                       LINE_FREQ_LEVELS[LINE_FREQ_DEFAULT])
         if random.random() < 0.03:
             pick = random.random()
-            if pick < 0.35:
-                self.jump_t = 1.0
-            elif pick < 0.6:
-                self.action, self.action_t = "sway", 1.0
-            elif pick < 0.7:
-                self.action, self.action_t = "stretch", 1.0
+            if pick < 0.7:
+                # 七成交给小动作（具体抽哪个交给 _play_idle_action，它按权重挑）
+                self._play_idle_action()
             else:
                 # 剩下 30% 的机会拿来冒话，两句之间按主人在「语录频率」里选的间隔隔开
                 if self._music_playing():
@@ -7358,8 +8401,47 @@ class PetWindow(QWidget):
             Qt.MouseButton.NoButton, Qt.MouseButton.NoButton, e.modifiers()))
         return True
 
+    # ---------- 拖放（P6 派活）----------
+    # 这里只做转发：判定和后续动作都在 pet_ext/dispatch.py 里，主窗口不掺和业务。
+    # ⚠️ 开了「鼠标穿透」（WA_TransparentForMouseEvents）时这几个事件根本不会来，
+    #    所以 `can_accept()` 里也会返回 False —— 别以为拖放坏了，是穿透吃掉了。
+    def _dispatch_ext(self):
+        return (getattr(self, "ext", {}) or {}).get("dispatch")
+
+    def dragEnterEvent(self, e):
+        ext = self._dispatch_ext()
+        if ext is not None and ext.can_accept(e.mimeData()):
+            e.setDropAction(Qt.DropAction.CopyAction)
+            e.accept()
+            ext.on_drag_enter()
+            return
+        e.ignore()
+
+    def dragMoveEvent(self, e):
+        ext = self._dispatch_ext()
+        if ext is not None and ext.can_accept(e.mimeData()):
+            e.setDropAction(Qt.DropAction.CopyAction)
+            e.accept()
+            return
+        e.ignore()
+
+    def dropEvent(self, e):
+        ext = self._dispatch_ext()
+        if ext is None:
+            e.ignore()
+            return
+        paths = ext.mime_paths(e.mimeData())
+        if not paths:
+            e.ignore()
+            return
+        e.setDropAction(Qt.DropAction.CopyAction)
+        e.accept()
+        ext.on_drop(paths)
+
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
+            # 换动作时的"滑过去"动画别跟人家的拖拽抢窗口
+            self._stop_geom_glide()
             # 点在歌词气泡那几颗 ⏮ / ⏸▶ / ⏭ 上：不进"蹦一下 + 响一声"那套，
             # 等松手再看点的是哪一颗（切歌 / 切播放暂停）
             kind = self._lyric_btn_kind(e.position())
@@ -7396,6 +8478,13 @@ class PetWindow(QWidget):
                     return
                 self.dragging = True
                 self.drag_offset = e.globalPosition().toPoint() - QPoint(self.x(), self.y())
+                # 正侧着身子走的话，被抓住就先站正（不然拖着一条侧身的鱼）
+                if getattr(self, "_amb_phase", None) in ("in", "walk"):
+                    self._amb_phase = None
+                    try:
+                        self.ext["anim"].player.play("idle", loop=True, restart=True)
+                    except Exception:
+                        pass
             if self.dragging and self.drag_offset is not None:
                 pos = e.globalPosition().toPoint() - self.drag_offset
                 self.move(pos)
@@ -7427,6 +8516,14 @@ class PetWindow(QWidget):
                 self.target = None
                 self.rest_until = self.t * self.tick_ms + random.randint(6000, 14000)
                 self._snap_to_edge()    # 松手后吸附到最近的边
+                if self.skin == SKIN_ANIM:
+                    # 拖拽期间动作换过的话，窗口宽度被"拖拽闸门"挡住没跟上
+                    #（_anim_clip_changed 见拖拽就返回）。现在手松了，补一次重排，
+                    # 窗口宽度回到当前动作该有的尺寸（围绕新家，200ms 缓动）。
+                    try:
+                        self._anim_clip_changed()
+                    except Exception as exc:
+                        print("[anim] 松手后补排窗口失败:", exc)
                 words = self.lines_for_say("DRAG_LINES")
                 if words and random.random() < 0.5:
                     self.say(random.choice(words))
@@ -7680,17 +8777,23 @@ class PetWindow(QWidget):
             self.say(f"上一轮 {self.agent_name} 消耗 ¥{amount:.4f}（{tokens / 1000:.1f}k token）")
 
     def _build_quick_menu(self):
-        """右键菜单（v1.1.0 起瘦身版）：**一条子菜单都没有**，全是点一下就走。
+        """右键菜单（v1.1.0 起瘦身版）：**只有「逗她一下」一条子菜单**，其余点一下就走。
 
         设置都搬进「打开设置…」那个窗口了，这里只留两类东西：
         「看一眼」（余额 / 天气 / 在放什么）和几条随手要用的开关与救命通道。
-        菜单里没有子菜单，也就没有那套"悬停展开 / 点击摆渡"的老毛病。
         （完整版老菜单的入口挪到设置窗口「通用 → 排查问题」里去了。）
+
+        「逗她一下」例外地做成二级菜单：主人 2026-10-23 要"自己选做哪个动作"，
+        所以展开列出当前形象能做的全部动作（灵动版是素材里的真动作）。
         """
         m = QMenu()
         m.addAction("查看余额", lambda: self.refresh_balance(silent=False))
         m.addAction("查看天气", self._get_weather)
         m.addAction("看一眼在放什么", self.check_music_now)
+        # 闲着时它自己也会做小动作，这一条是"主动逗一下"（灵动版播真动作，其余走程序化）
+        # 展开是二级菜单，可以点名要它做哪一个（内容跟着当前形象变）
+        self._add_tease_menu(m)
+        m.addAction("和她聊聊…", self.open_chat)
         m.addSeparator()
         m.addAction("打开设置…", defer_dialog(self.open_console))
         m.addSeparator()
@@ -7756,6 +8859,8 @@ class PetWindow(QWidget):
         #   真发生这种变动时，气泡里照旧会解释一句"余额少了…看着不像用掉的"。）
         m.addAction("查看天气", self._get_weather)
         m.addAction("看一眼在放什么", self.check_music_now)
+        self._add_tease_menu(m)        # 同快捷菜单：二级菜单里点名要它做哪个动作
+        m.addAction("和她聊聊…", self.open_chat)   # P5：侧边浮窗里跟 DeepSeek 说话
         # 新界面：v1.1.0 起设置都搬进这个窗口（老菜单先全留着当兜底，跑稳一版再收）
         m.addAction("打开设置…", defer_dialog(self.open_console))
         # 快速双击弹哪个窗口：也放在这块最常用的区域里（一级菜单点一下就能换）
@@ -7811,6 +8916,12 @@ class PetWindow(QWidget):
         a.setCheckable(True)
         a.setChecked(self.skin == SKIN_WIDGET)
         a.triggered.connect(lambda _, n=SKIN_WIDGET: self.set_skin(n))
+        # 第三种：灵动版（视频拆帧，真的会做动作）。素材不在时这一项不出现
+        if os.path.isdir(os.path.join(APP_DIR, "sprites_anim")):
+            a = skin_menu.addAction(f"{SKIN_ANIM}（带动作）")
+            a.setCheckable(True)
+            a.setChecked(self.skin == SKIN_ANIM)
+            a.triggered.connect(lambda _, n=SKIN_ANIM: self.set_skin(n))
         skin_menu.addSeparator()
         # 形象库：三维 / 挂件两本分开，上传·换图·改名·删掉·挑回来用都在这个窗口里
         n_pet = len(self.skin_library("pet"))
@@ -8088,8 +9199,13 @@ class PetWindow(QWidget):
             "BUBBLE_STYLES": BUBBLE_STYLES,
             "LINE_FREQ_LEVELS": LINE_FREQ_LEVELS,
             "LINE_SECTIONS": LINE_SECTIONS,
+            # 「它会做什么」卡片要列这三个程序化小动作（名字 / 权重 / 衰减）
+            "ACTIONS": dict(ACTIONS),
             "SKIN_PET": SKIN_PET,
             "SKIN_WIDGET": SKIN_WIDGET,
+            # 灵动版：素材不在就传空串，设置页按"有没有值"决定要不要显示第三档
+            "SKIN_ANIM": (SKIN_ANIM if os.path.isdir(os.path.join(APP_DIR, "sprites_anim"))
+                          else ""),
             "LAYER_LABELS": dict(self.LAYER_LABELS),
             "currency_symbol": currency_symbol,
             "human_mb": human_mb,
@@ -8316,6 +9432,31 @@ class PetWindow(QWidget):
     def _menu_icon_name(self, text):
         return self._menu_icon_lookup(MENU_ICONS, text)
 
+    def _action_icon_table(self):
+        """「逗她一下」子菜单里每个动作的图标：(中文名, 图标名) 表。
+
+        两种形象的动作来源不同：灵动版是素材里的真动作（`pet_ext/anim.py` 的
+        `CLIP_ICONS`，按 clip 名对），三视图 / 挂件是 `ACTIONS` 里那三个程序化动作。
+        没登记的动作**不写进表** → 调用方退回父项图标，不会空着。
+
+        ⚠️ 这张表是给 `_menu_icon_lookup` 用的（前缀匹配）：三视图里被关掉的动作
+        文字是「摇摆（已关闭）」，精确 dict 查会查不到。
+        """
+        out = []
+        if self.skin == SKIN_ANIM:
+            _anim = getattr(self, "ext", {}).get("anim")
+            if _anim is not None:
+                for label, clip in _anim.once_choices():
+                    name = _anim.icon_for(clip)
+                    if name:
+                        out.append((label, name))
+        else:
+            for key, info in ACTIONS.items():
+                name = ACTION_ICONS.get(key)
+                if name and info:
+                    out.append((info[0], name))
+        return tuple(out)
+
     def _iconize_menu(self, menu, color=None, inherit=""):
         """给一棵菜单（连各级子菜单）按 MENU_ICONS 配上图标。
 
@@ -8337,7 +9478,10 @@ class PetWindow(QWidget):
             if act.isSeparator():
                 continue
             sub = act.menu()
-            name = self._menu_icon_name(act.text()) or inherit
+            # 三级回退：菜单通用表 → 动作表（「逗她一下」的子项各配一个）→ 继承父项
+            name = (self._menu_icon_name(act.text())
+                    or self._menu_icon_lookup(self._action_icon_table(), act.text())
+                    or inherit)
             if not name:
                 if sub is not None:
                     self._iconize_menu(sub, color, "")
@@ -9417,6 +10561,17 @@ class PetWindow(QWidget):
         self.mode = mode
         self.target = None
         self.cfg["mode"] = mode
+        if mode != "still":
+            self._clear_still_side()     # 原地待着的"转头"状态带不走
+        # 切模式：散步/跟随的走路动画要收干净（不然会侧着身子站在那儿）。
+        # 这里不等 crab_out 播完 —— 用户切了模式就该立刻站正。
+        if getattr(self, "_amb_phase", None) is not None:
+            self._amb_phase = None
+            try:
+                if self.skin == SKIN_ANIM and "anim" in getattr(self, "ext", {}):
+                    self.ext["anim"].player.play("idle", loop=True, restart=True)
+            except Exception:
+                pass
         if mode == "still":
             self._still_face_front()   # 切到「原地待着」立刻站正，不用等下一帧
         self.update()
@@ -9425,6 +10580,8 @@ class PetWindow(QWidget):
         """「原地待着时也跟着鼠标转」开关（当前形象都生效：大肥鱼会转侧面，挂件会左右翻）。"""
         self.still_face_cursor = bool(on)
         self.cfg["still_face_cursor"] = bool(on)
+        if not on:
+            self._clear_still_side()     # 关掉就转回正面，别留个侧身站着
         self.update()
 
     def set_balance_always(self, on):
@@ -9770,6 +10927,111 @@ class PetWindow(QWidget):
             self.flip_x = False
         self.update()
 
+    def set_action_enabled(self, key, on):
+        """「它会做什么」卡片里那条开关：关掉的动作既不随机出现，也不能从菜单点。
+
+        存的是**被关掉的名字**列表（`actions_off`，沿用 v1.1.5 的老字段），
+        不是"开着哪些"——这样以后加新动作不用改老配置。
+        菜单里被关掉的那条会**置灰保留**（不隐藏），不然"为什么它不做这个动作"查不出来。
+        """
+        off = [k for k in (self.cfg.get("actions_off") or ()) if k != key]
+        if not on:
+            off.append(key)
+        self.cfg["actions_off"] = off
+
+    def sprite_rect(self):
+        """当前精灵在窗口里占的矩形（窗口坐标）。
+
+        干什么用的：往桌宠身上挂小按钮（比如聊天那个圆圈）时得知道"鱼在哪儿"。
+        ⚠️ 不能直接用窗口矩形：灵动版的窗口宽度是**按所有动作里最宽的画布**固定的
+        （防止换动作时窗口变宽导致合成器错位，见 `_calc_window_size`），
+        鱼只占中间一条，窗口右边一大片是空的 —— 按窗口算，按钮会飘在离鱼很远的地方。
+
+        算法和 `paintEvent` 里 `draw_one` 保持一致：横向居中、脚底贴窗口下沿。
+
+        ⚠️ 灵动版**用 idle 那段的画布尺寸算，不用当前帧**：每段动作的画布宽度不一样
+        （idle 238 / 水枪 689），拿当前帧算的话，挂在鱼身上的小按钮会**跟着动作左右乱跳**
+        （实测：切动作时按钮从 354 跳到 323，看着像坏了）。idle 是她待着时的样子，
+        拿它当锚点最稳，换动作时按钮纹丝不动。
+        """
+        bottom = self.height() - MARGIN - 10
+        w = h = 0
+        if self.skin == SKIN_ANIM:
+            _pl = getattr(getattr(self, "ext", {}).get("anim"), "player", None)
+            size = None
+            if _pl is not None:
+                size = ((_pl.manifest or {}).get("clips") or {}).get("idle", {}).get("size")
+            if size:
+                h = self._body_h()
+                w = int(round(size[0] * h / float(size[1])))
+            else:
+                pix = _pl.current() if _pl is not None else None
+                if pix is not None and pix.height():
+                    h = self._body_h()
+                    w = int(round(pix.width() * h / pix.height()))
+        if not w:
+            key = self._sprite_key()
+            pix = self.sprites.get((key[0], key[1])) if key else None
+            if pix is not None and pix.height():
+                w, h = pix.width(), pix.height()
+        if not w:
+            w, h = self.width(), self._body_h()
+        cx = self.width() / 2.0
+        return QRect(int(round(cx - w / 2.0)), int(round(bottom - h)), int(w), int(h))
+
+    def sprite_ready(self):
+        """精灵尺寸算得准不准（灵动版启动那一两秒还没有当前帧，算出来的是窗口宽度）。"""
+        if self.skin == SKIN_ANIM:
+            _pl = getattr(getattr(self, "ext", {}).get("anim"), "player", None)
+            if _pl is None:
+                return False
+            size = ((_pl.manifest or {}).get("clips") or {}).get("idle", {}).get("size")
+            return bool(size)
+        key = self._sprite_key()
+        return bool(key and self.sprites.get((key[0], key[1])))
+
+    def restart_pet(self):
+        """一键重启：改完代码不用手动关掉再双击脚本。
+
+        ⚠️ 不能自己"延迟启动"——`QApplication.quit()` 之后事件循环就停了，
+        `QTimer.singleShot` 不会触发；立刻起新进程又会被单实例锁拦住。
+        所以交给 `_relaunch.py`：它等本进程退出、等管道名释放，再起一个新的。
+        """
+        try:
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            if getattr(sys, "frozen", False):
+                # 打包版：`__file__` 在 `_internal` 里，既没有 `_relaunch.py` 也没有 `桌宠.py`，
+                # 照源码那条路走等于用 exe 去"跑脚本"——旧进程一退就再也回不来。
+                # 让 cmd 等两秒（约 ping 三次）再启动 exe 自己，等单实例锁释放。
+                exe = sys.executable
+                comspec = os.environ.get("COMSPEC") or "cmd.exe"
+                subprocess.Popen(
+                    [comspec, "/c", f'ping -n 3 127.0.0.1 >nul & start "" "{exe}"'],
+                    creationflags=flags)
+            else:
+                here = os.path.dirname(os.path.abspath(__file__))
+                helper = os.path.join(here, "_relaunch.py")
+                target = os.path.join(here, "桌宠.py")
+                subprocess.Popen([sys.executable, helper, str(os.getpid()),
+                                  target, here, sys.executable],
+                                 cwd=here, creationflags=flags)
+        except Exception as exc:
+            self.say(f"重启失败：{type(exc).__name__}: {exc}", seconds=4.0, again=True)
+            return
+        try:
+            self.save_config()
+        except Exception:
+            pass
+        QApplication.quit()
+
+    def set_chat_bubble(self, on):
+        """开 / 关桌宠右上角那个圆形聊天按钮（设置 → 通用 → 聊天入口）。"""
+        self.cfg["chat_bubble"] = bool(on)
+        self.save_config()
+        ext = (getattr(self, "ext", {}) or {}).get("chat")
+        if ext is not None:
+            ext.refresh_bubble()
+
     def set_locked(self, on):
         """锁定位置：固定在原地 —— 点它、双击它、右键菜单都照常，就是拖着不动了。
 
@@ -9800,39 +11062,798 @@ class PetWindow(QWidget):
         · 变大小是"原地缩放"：脚底和中心不动，免得滑块一拖它整只往下出溜。
         """
         mult = self._clamp_size(mult)
+        self._stop_geom_glide()        # 改大小要自己摆窗口，别让换动作的滑动动画插一脚
         self.cfg["size"] = mult
         self.cross_t = 0.0
         self.prev_key = None
         old_x, old_y = self.x(), self.y()
         old_w, old_h = self.width(), self.height()
         self.cur_h = int(340 * mult)
-        self._prune_sprites(self.cur_h)
-        self._ensure_sprites(self.cur_h)
-        self._apply_window_size()
-        if old_w:                      # 建窗口那一趟（还没摆位）不用动位置
-            self.move(int(old_x + old_w / 2 - self.width() / 2),
-                      int(old_y + old_h - self.height()))
-        self.snap_into_screen()
+        # 灵动版根本不画三视图精灵（画的是帧序列），所以拖滑块时没必要一次次重缩三张图。
+        # 省下的不只是那 0.8ms，更重要的是不再每个 tick 造/扔三张位图 ——
+        # 这种高频分配会频繁触发 Python 的垃圾回收，实测能抖出 60~70ms 的尖峰。
+        if self.skin != SKIN_ANIM:
+            self._prune_sprites(self.cur_h)
+            self._ensure_sprites(self.cur_h)
+        # 尺寸和位置一次改完（setGeometry），别 resize 完再 move —— 那样多付 1.7ms
+        self._apply_window_size(quantize=True, anchor=(old_x, old_y, old_w, old_h))
+        self._schedule_size_settle()
+        self._anim_rescale()           # 灵动版：通知帧动画按新高度重排（后台分批，不阻塞）
+        self.snap_into_screen()        # 只在真越界时才动窗口
+    def _body_h(self):
+        """身体区高度（像素）。三视图 / 挂件就是 cur_h；灵动版按素材留白放大一点。
 
-    def _apply_window_size(self):
-        """按当前档位摆好窗口：精灵宽度 + 两边留白，但不小于 MIN_WIN_W（气泡要放得下字）。
+        只在画灵动版那一支和算窗口尺寸时用，三视图的精灵高度仍按 cur_h，
+        所以老形象的行为一点没变。
+        """
+        if self.skin == SKIN_ANIM:
+            return int(self.cur_h * ANIM_BODY_ZOOM)
+        return self.cur_h
+
+    def _anim_rescale(self):
+        """灵动版改大小：通知帧动画按新高度重排（**不阻塞**）。
+
+        三视图 / 挂件的精灵是 `_ensure_sprites` 按 cur_h 现缩的，天然跟着变；
+        灵动版的帧是缓存的 QPixmap，得显式重排。
+        但重排 241 帧要 250~315ms，如果在这里同步做，拖滑块时每动一格就卡一下
+        （2026-10-23 主人报的"调整尺寸明显卡顿"就是这个）。所以：
+        尺寸立刻生效（绘制时按目标高度缩放），重排交给防抖 + 分批解码。
+        """
+        _anim = getattr(self, "ext", {}).get("anim")
+        if _anim is None or self.skin != SKIN_ANIM:
+            return                      # 不是灵动版就别白费力气重排帧
+        try:
+            _anim.player.hold()         # 正在拖：后台解码让路，别跟滑块抢主线程
+            _anim.schedule_reload_soon()
+        except Exception as exc:
+            print("[anim] 改大小后重排帧失败:", exc)
+
+    def _anim_clip_changed(self):
+        """灵动版换动作：窗口宽度跟着当前动作走，要挪位置就**走过去**。
+
+        背景（2026-10-24）：每段动作的裁剪框不同，鸽子 / 水枪这些把道具伸出去的段
+        需要更宽的窗口，播完还得收回来 —— 不然长期变宽的透明区会挡住下面窗口的点击。
+
+        但"一帧之内变宽 + 夹回屏幕、播完再一帧跳回来"很突兀，主人原话是
+        "开始一个动作后应该就在原地开始，而不是瞬移到一个位置，播完再瞬移回来"；
+        第二轮又补了一句更关键的："这个挪动不是生硬的拖过去，是要运行桌宠自己的
+        走路动画，不用很快需要和谐"。所以现在的规则是：
+
+        1. 记一个"家"（`_anim_home`）—— 主人把鱼放在哪（屏幕坐标：中心 x、脚底 y）。
+        2. 每段动作都从"家"推导目标几何：宽度按画布算，位置钉在家上；
+           装不下屏幕就夹回来（这时鱼得往里挪一点）。
+        3. **要挪位置**（平移超过 `WALK_GAP`）：切到素材里的「走路」动作，
+           用 `WALK_SPEED` 走过去，到了再播目标动作。⚠️ 这段编排**不在这里**，
+           而在 `_anim_walk_to_clip()`（必须在 `play()` 之前决定，原因见那里的注释）；
+           走到位切目标动作时才会回到本方法，那时中心已经对上，只剩原地张开。
+        4. **只变宽**（中心不动）：窗口原地张开，`_geom_glide` 200ms 缓出。
+        5. 因为锚点一直是"家"、不是"当前位置"，播完回待机就走回原处 —— 不会一格格漂。
+
+        "家"由 `moveEvent` 维护：除了本类自己的滑动动画，任何移动（用户拖、恢复上次位置、
+        贴边吸附、改大小）都会顺手把家挪到新位置。所以不需要猜"是不是用户拖的"。
+        """
+        if self.skin != SKIN_ANIM:
+            return
+        if not hasattr(self, "ext") or "anim" not in getattr(self, "ext", {}):
+            return
+
+        # 用户正拖着窗口：位置归他管。这时候按"家"重排窗口（哪怕只是 200ms 的
+        # 张开/收窄动画）都会跟拖拽抢 —— 动画每 16ms 挪一下窗口，鼠标也在挪，
+        # 两个打架就是"动画与实际位置不一致"。宽度的事等松手再补
+        # （mouseReleaseEvent → _snap_to_edge 之后会调一次这里）。
+        if getattr(self, "dragging", False):
+            return
+
+        # 垂直补偿渐变：大口吃零食比别的段低 16px，切过去别硬跳
+        pl = self.ext["anim"].player
+        self._anim_dy_from = self._anim_dy_now()
+        self._anim_dy_to = pl.clip_dy() if hasattr(pl, "clip_dy") else 0
+        self._anim_dy_t0 = time.perf_counter()
+
+        # 走路编排自己会调 play("move")，那次也会递归回到这里 —— 别插手它的窗口
+        if getattr(self, "_anim_walking", False):
+            if pl.clip in (CRAB_IN, CRAB_LOOP, CRAB_OUT, "move"):
+                return                      # 走路自己那趟（含转身三段），忽略
+            # 走位途中被别的东西顶掉了（通知播挥手 / 外部 play）：收工。
+            # **家 = 当前位置**再重排 —— play 已经发生（来不及重新走位了），
+            # 家要是还留在旧家，下面的 _geom_glide 会从走位半路一路滑回旧家，
+            # 又是一个大跨度闪弹。
+            self._cancel_walk(play_task=False)
+            self._anim_home = (self.x() + self.width() / 2,
+                               self.y() + self.height())
+
+        first = getattr(self, "_anim_home", None) is None
+        if first:
+            self._anim_home = (self.x() + self.width() / 2, self.y() + self.height())
+        cx, bottom = self._anim_home
+
+        w, h = self._calc_window_size()
+        x = int(round(cx - w / 2))
+        y = int(round(bottom - h))
+        geo = self._move_geo()      # 跟随时是"光标那块屏"，不然跨屏后会被夹回原屏
+        # 「用户正抓着」触发的 snap（_cancel_walk → _anim_snap_noclamp）不夹屏幕：
+        # 贴边抓住那一刻窗口要从 206 张到 426，夹屏会把中心强行往里推 ——
+        # 鱼从鼠标手里"挣脱"跳 50~100px。跟手要紧，宽窗口探出屏幕一点没关系，
+        # 松手后 _snap_to_edge / _settle 自然会收回屏幕内。
+        if not getattr(self, "_anim_snap_noclamp", False):
+            # 夹屏夹的是"鱼"不是"窗口"：窗口固定成最宽画布后比鱼宽一截，
+            # 按窗口夹会把鱼往里推（贴边时离屏幕边 170 多像素）。
+            m = max(0.0, (w - self._content_w()) / 2.0)
+            x = max(geo.left() - m, min(geo.right() - w + 1 + m, x))
+            y = max(geo.top(), min(geo.bottom() - h + 1, y))
+
+        # 刚"走到位"接动作的这一下：**一帧到位**，不要 200ms 慢慢张开。
+        # 为什么（2026-10-24 主人报的"衔接时左右抽搐 / 向左闪一下"）：走路时窗口窄，
+        # 而宽动作那帧宽得多。慢慢张开的话水柱是"从窗口边上一点点漏出来"的；
+        # 而改完尺寸**不当帧重画**的话，合成器会把旧的窄画面按新窗口摆出去 ——
+        # 鱼看着往左跳了半个宽度，下一帧又弹回来。所以这里 refresh=True（同步重画）。
+        if getattr(self, "_anim_snap_size", False):
+            self._anim_snap_size = False
+            self._anim_snap_noclamp = False
+            self._geom_glide_busy = True
+            try:
+                if (w, h, x, y) != (self.width(), self.height(), self.x(), self.y()):
+                    self._set_win_size(w, h, x, y, refresh=True)
+            finally:
+                self._geom_glide_busy = False
+            return
+
+        # 尺寸**一帧到位**，别再走 200ms 的缓动。
+        #
+        # 2026-10-25 改（主人录屏「抽搐」实锤）：
+        # 原来这里交给 `_geom_glide` 用 OutCubic 分十来步把宽度滑过去。但那十来步
+        # 每一步都是一次"窗口改宽 + 内容重画"，而合成器只要在其中任意一步取到
+        # 旧画面（按新窗口左上角摆出去），鱼就整体偏 Δw/2 一帧 —— 12 次改宽就是
+        # 12 次抽奖，难怪"偶发"却总能撞上。`refresh=True` 只能减少，压不死。
+        #
+        # 而这段缓动**视觉上是空的**：`pw`（鱼的绘制宽度）只跟动作画布有关，
+        # 跟窗口宽度无关，窗口变宽的过程是透明的 —— 主人看到的"原地张开"
+        # 其实是瞬间发生的，缓动只是让窗口分几步追上去。
+        # 所以直接一帧给足，观感一模一样，改宽次数从十来次降到 1 次。
+        if (w, h) != (self.width(), self.height()):
+            self._geom_glide_busy = True
+            try:
+                self._set_win_size(w, h, x, y, refresh=True)
+            finally:
+                self._geom_glide_busy = False
+            self._anim_cmd = (x, y, w, h)
+            return
+
+        # 尺寸没变、只是要挪位置 → 才走缓动（走路素材缺失时的兜底）
+        self._geom_glide(w, h, x, y)
+
+    def _anim_walk_to_clip(self, clip, loop):
+        """要挪地方就**走过去**：转身 → 横着走 → 转回正面 → 才播目标动作。
+
+        素材是主人让我去 GitHub 找的（2026-10-24）：`PC2005-cloud/dsh-pet` 的
+        「螃蟹走路」—— 正面转侧身、侧身横着走、再转回正面，10 秒 241 帧。
+        `_build/convert_crab.py` 把它切成三段：
+
+            crab_in   帧 6..29     原地转身（窗口不动）
+            crab      帧 30..179   侧身横着走（窗口在这段里平移）
+            crab_out  帧 180..206  转回正面（窗口不动）
+
+        为什么要分三段：主人原话「走路动画有一个启动流程，但是在启动流程的时候你就
+        强行让它开始移动了」。素材前 0.5 秒确实是在原地转身，那时候平移就成了滑着转圈。
+        现在按"转完再走、走到再转回来"接力，每一段都由播放器的收尾回调推进
+        （`_walk_after_once` / `_on_walk_arrived`），不另开定时器。
+
+        「螃蟹走路」朝左走，往右走要**镜像**（`_walk_flip`，paintEvent 里跟 `flip_x` 异或）。
+
+        素材里没有这三段时（老版本 / 素材被删）退回上一版的做法：`move` + 立刻给 target。
+        """
+        if self.skin != SKIN_ANIM:
+            return False
+        if not hasattr(self, "ext") or "anim" not in getattr(self, "ext", {}):
+            return False
+        # 散步/跟随那套走路动画让位（这一趟由 `_walk_phase` 三段接力负责）
+        self._amb_phase = None
+        pl = self.ext["anim"].player
+        try:
+            clips = pl.manifest.get("clips") or {}
+        except Exception:
+            return False
+        if clip not in clips or clip in (CRAB_IN, CRAB_LOOP, CRAB_OUT, "move"):
+            return False
+        # 上一趟还没收尾：**作废它**，按新动作重新决定走不走。
+        # 千万别直接 return False —— 那样 play_once 会把新动作直接播出来，
+        # `_anim_clip_changed` 里再 cancel 时"家"还是旧家，窗口从走位半路
+        # 200ms 滑回旧家 —— 110px 的闪弹（主人："切动作闪弹几率很高"就是它，
+        # 连点动作时上一趟经常还没收完）。作废后照常往下算：该走走位、
+        # 该原地原地，跟没有上一趟一样。
+        if getattr(self, "_walk_task", None) is not None:
+            self._cancel_walk(play_task=False)
+        if getattr(self, "dragging", False):               # 正在被拖也别走
+            return False
+        crab = all(c in clips for c in (CRAB_IN, CRAB_LOOP, CRAB_OUT))
+
+        geo = self._move_geo()
+
+        # 目标：按目标动作的画布算，位置钉在"家"上，装不下就夹回屏幕
+        if getattr(self, "_anim_home", None) is None:
+            self._anim_home = (self.x() + self.width() / 2, self.y() + self.height())
+        home_cx, _home_bottom = self._anim_home
+        # ⚠️ 用**鱼身宽度**而不是窗口宽度：窗口固定成最宽画布之后，
+        # 拿窗口宽度算目标点会被夹住 → dest_cx 只差一点点 → 走位刚起步就到，
+        # 表现就是"走路动画只放几帧"（主人 2026-10-25 报的）。
+        try:
+            tw = self._canvas_to_content_w(pl.clip_canvas(clip))
+            ww, wh = float(self.width()), float(self.height())   # 窗口宽度固定，不再改
+        except Exception:
+            return False
+
+        cur_cx = self.x() + self.width() / 2
+        # "从哪儿算"：原地待着时按"家"算（做完要回去）；散步/跟随时家就在脚底下，
+        # 按当前位置算 —— 它本来就一直在动，没有"回去"这回事。
+        still = getattr(self, "mode", "still") == "still"
+        anchor_cx = home_cx if still else cur_cx
+        # ⚠️ 2026-10-25 补（走位只放几帧的第二层原因）：
+        #   `_anim_home` 记的是**窗口中心**，不是鱼的中心 —— 锚点就得按窗口宽算。
+        #   而且窗口比鱼宽，贴边时窗口的透明留白是故意探出屏幕的（见 `_settle`），
+        #   这里要是按"窗口贴边"夹，会把刚吸附好的位置往回拽一整个留白（实测 130px），
+        #   该走的那段被这个瞬移吃掉，只剩 20px 要走 —— 看着就是"走路只放几帧"。
+        #   所以留白要跟着一起算，跟 `_settle` 保持一致。
+        m_t = max(0.0, (ww - tw) / 2.0)        # 目标动作下窗口单侧的透明留白
+        tx = int(round(anchor_cx - ww / 2))
+        tx = max(geo.left() - m_t, min(geo.right() - ww + 1 + m_t, tx))
+        dest_cx = tx + ww / 2.0
+
+        if abs(dest_cx - cur_cx) < WALK_GAP:               # 中心几乎没动 → 不用走
+            return False
+
+        # ① 窗口收到「走路」的宽度（围绕**当前中心**，鱼不跟着横跳）。
+        #    改完当帧重画（refresh=True），别让合成器拿旧画面去凑新窗口。
+        if (ww, wh) == (self.width(), self.height()):
+            # 宽度固定之后这条是常态：**位置一律别动**。
+            # 这里原来照样按"窗口贴边"夹一次，等于把 `_settle` 的贴边结果废掉。
+            wx_now, wy = self.x(), self.y()
+        else:
+            wx_now = int(round(cur_cx - ww / 2))
+            wy = int(round(self.y() + self.height() - wh))
+            wx_now = max(geo.left(), min(geo.right() - ww + 1, wx_now))
+            wy = max(geo.top(), min(geo.bottom() - wh + 1, wy))
+        self._anim_walking = True
+        self._walk_task = (clip, loop)
+        # 走之前把"家"存一份：走路时窗口比待机宽，贴边时中心会被屏幕夹住，
+        # 路上也可能把 _anim_home 蹭偏一点；做完动作要精确回原位就靠这一份（实测差过 10px）。
+        self._walk_home = self._anim_home if still else None
+        self._walk_dest = (dest_cx, self.y() + self.height() / 2.0)
+        self._walk_flip = dest_cx > cur_cx        # 素材朝左走，往右要镜像
+        self._walk_phase = "in" if crab else "walk"
+        try:
+            self._geom_glide_busy = True
+            try:
+                if (ww, wh, wx_now, wy) != (self.width(), self.height(), self.x(), self.y()):
+                    self._set_win_size(ww, wh, wx_now, wy, refresh=True)
+            finally:
+                self._geom_glide_busy = False
+            if crab:
+                if not pl.play(CRAB_IN, loop=False, restart=True, rate=WALK_TURN_RATE):
+                    raise RuntimeError("crab_in 播不了")
+            else:
+                if not pl.play("move", loop=True, restart=True):
+                    raise RuntimeError("move 播不了")
+        except Exception as exc:
+            print("[anim] 走路动作起不来，退回直接播:", exc)
+            self._anim_walking = False
+            self._walk_task = None
+            self._walk_phase = None
+            self._walk_flip = False
+            return False
+
+        if not crab:
+            # 老素材：没有转身段，直接给目标就走
+            if not still:
+                self._anim_home = (dest_cx, self.y() + self.height())
+            self.target = self._walk_dest
+            self._stuck_ticks = 0
+            self.cur_speed = 0.0
+        # 有转身段时**先不动**：等 crab_in 播完（`_walk_after_once` 里给 target）
+        self.update()
+        return True
+
+    def _walk_after_once(self, clip):
+        """走位三段的接力。返回 True = 这一段我接手了，别走通用的"播完回待机"。"""
+        phase = getattr(self, "_walk_phase", None)
+        if phase == "in" and clip == CRAB_IN:
+            self._walk_phase = "walk"
+            pl = self.ext["anim"].player
+            pl.play(CRAB_LOOP, loop=True, restart=True)
+            if getattr(self, "mode", "still") != "still":
+                # 散步/跟随：家在脚底下，落点就是新家（不搬的话到位会按旧家摆窗口）
+                self._anim_home = (self._walk_dest[0], self.y() + self.height())
+            self.target = self._walk_dest
+            self._stuck_ticks = 0
+            self.cur_speed = 0.0
+            return True
+        if phase == "out" and clip == CRAB_OUT:
+            self._finish_walk_task()
+            return True
+        return False
+
+    # ---------- 散步 / 跟随的走路动画（2026-10-25）----------
+    # 主人原话：「灵动模式跟随鼠标和自由散步的动画只有正面很诡异，把那个散步动画放进去」。
+    # 原来散步/跟随播的是 `move`（正面朝镜头走），看着像在飘。
+    # 现在改用和"去那儿做动作"同一套「螃蟹走路」：
+    #     起步 crab_in（原地转身）→ 横着走 crab（循环）→ 停下 crab_out（转回正面）
+    # 和 `_walk_task` 那套**完全分开**（那套是"走到某处再做某个动作"，有终点、有目标 clip）。
+
+    def _amb_walk_start(self):
+        """散步/跟随：起步 —— 原地转身，转完接横着走（`_amb_after_once` 推进）。"""
+        if self.skin != SKIN_ANIM:
+            return
+        _anim = getattr(self, "ext", {}).get("anim")
+        if _anim is None:
+            return
+        pl = _anim.player
+        clips = pl.manifest.get("clips") or {}
+        if all(c in clips for c in (CRAB_IN, CRAB_LOOP, CRAB_OUT)):
+            self._amb_phase = "in"
+            self._amb_t0 = time.perf_counter()
+            if pl.play(CRAB_IN, loop=False, restart=True, rate=WALK_TURN_RATE):
+                return
+            self._amb_phase = None
+        pl.play("move", loop=True, restart=True)      # 没有螃蟹素材：退回正面走
+
+    def _amb_walk_stop(self):
+        """散步/跟随：到了 —— 转回正面，转完回待机。"""
+        ph = getattr(self, "_amb_phase", None)
+        if ph is None:
+            return
+        _anim = getattr(self, "ext", {}).get("anim")
+        if _anim is None:
+            self._amb_phase = None
+            return
+        if ph == "in":
+            # 还在转身（正面 → 侧身）：等这段播完，回调里看到 target 空了就直接转回正面。
+            # 现在打断会从"转到一半"硬切，反而闪。
+            return
+        if ph == "walk":
+            self._amb_phase = "out"
+            self._amb_t0 = time.perf_counter()
+            if _anim.player.play(CRAB_OUT, loop=False, restart=True, rate=WALK_TURN_RATE):
+                return
+        self._amb_phase = None
+        _anim.player.play("idle", loop=True, restart=True)
+
+    def _amb_after_once(self, clip):
+        """散步走路三段的接力。返回 True = 这一段我接手了，别走通用的"播完回待机"。"""
+        ph = getattr(self, "_amb_phase", None)
+        if ph is None:
+            return False
+        _anim = getattr(self, "ext", {}).get("anim")
+        if _anim is None:
+            self._amb_phase = None
+            return False
+        pl = _anim.player
+        if ph == "in" and clip == CRAB_IN:
+            if self.target is not None or getattr(self, "_walk_task", None) is not None:
+                if not pl.play(CRAB_LOOP, loop=True, restart=True):
+                    self._amb_phase = None
+                    return False
+                self._amb_phase = "walk"
+            else:
+                self._amb_phase = "out"
+                if not pl.play(CRAB_OUT, loop=False, restart=True, rate=WALK_TURN_RATE):
+                    self._amb_phase = None
+                    pl.play("idle", loop=True, restart=True)
+            return True
+        if ph == "out" and clip == CRAB_OUT:
+            self._amb_phase = None
+            if self.target is not None:
+                # 刚转回正面、目标又有了（鼠标又动了 / 散步挑下一点）：直接再走，别先在待机停一下
+                self._amb_walk_start()
+            else:
+                pl.play("idle", loop=True, restart=True)
+            return True
+        return False
+
+    def _amb_sync_walk(self, dx):
+        """每走一步都对一次：散步/跟随要走路就起「螃蟹走路」，方向按 dx 镜像。"""
+        if self.skin != SKIN_ANIM:
+            return
+        if getattr(self, "_walk_task", None) is not None:
+            return                       # "去那儿做动作"那趟自己管，别插手
+        if self.mode not in ("wander", "follow"):
+            return
+        if getattr(self, "dragging", False) or self.target is None:
+            return
+        ph = getattr(self, "_amb_phase", None)
+        # ⭐ 兜底（2026-10-25）：转身 / 转回正面这两段是靠"播完回调"推进的，
+        # 回调万一没来（被别的动作顶掉、解码卡住），状态就永远停在 in/out。
+        # 而 tick 里 `in/out` 会把 step 置 0 —— 表现就是**跟随鼠标突然一动不动**。
+        # 素材一段只有 0.63 秒，超过 1.5 秒一定是出事了，直接作废重来。
+        # "walk" 不设超时：跟随时它本来就该一直走。
+        if ph in ("in", "out"):
+            t0 = getattr(self, "_amb_t0", 0.0)
+            if t0 and time.perf_counter() - t0 > 1.5:
+                print(f"[anim] 散步走路卡在 {ph} 超过 1.5 秒，强制重置")
+                self._amb_phase = None
+                ph = None
+        if ph in ("in", "walk"):
+            self._walk_flip = dx > 0     # 素材朝左走，往右要镜像
+            return
+        if ph == "out":
+            return                       # 正在转回正面，等它转完（`_amb_after_once` 会接着走）
+        self._walk_flip = dx > 0
+        self._amb_walk_start()
+
+    def _finish_walk_task(self):
+        """走位结束（转回正面了 / 没转身段直接到了）：把这一趟要做的动作放出来。
+
+        接动作这一下**一帧到位**：撤走路标记 → `play` 触发窗口重排 →
+        `_anim_snap_size` 让它直接给足宽度并当帧重画（不走 200ms 张开）。
+        """
+        task = getattr(self, "_walk_task", None)
+        home = getattr(self, "_walk_home", None)
+        self._walk_task = None
+        self._walk_phase = None
+        self._walk_flip = False
+        self._walk_home = None
+        if not getattr(self, "_anim_walking", False):
+            return
+        self._anim_walking = False
+        if home is not None:
+            # 原地待着模式下，"家"以走之前的为准（路上被夹住/被蹭偏都不算）
+            self._anim_home = home
+        if not task:
+            return
+        clip, loop = task
+        self._anim_snap_size = True
+        try:
+            self.ext["anim"].player.play(clip, loop=loop, restart=True)
+        except Exception as exc:
+            print("[anim] 走到位后播目标动作失败:", exc)
+        finally:
+            self._anim_snap_size = False
+            self.update()
+
+    def _on_walk_arrived(self):
+        """散步引擎走到（或走不动）了。
+
+        正常走位：先播 `crab_out` 把身子转回正面（窗口不动），转完才接动作 ——
+        不然从"侧身"直接切到"正面"的动作，就是主人说的"没有侧面转身的过渡动画"。
+        老素材（没有 crab_out）：直接接动作。
+        """
+        if getattr(self, "_walk_phase", None) == "walk":
+            self._walk_phase = "out"
+            try:
+                ok = self.ext["anim"].player.play(
+                    CRAB_OUT, loop=False, restart=True, rate=WALK_TURN_RATE)
+            except Exception as exc:
+                print("[anim] 转回正面播不了，直接接动作:", exc)
+                ok = False
+            if ok:
+                return
+        # 散步/跟随走到目标（不是"去那儿做动作"那一趟）：侧身要**当场**转回正面 ——
+        # `crab` 是循环走路动画，不转就是"到了还在原地跑"（主人 2026-10-25 报的）。
+        if (getattr(self, "_walk_task", None) is None
+                and getattr(self, "_amb_phase", None) in ("in", "walk")):
+            self._amb_walk_stop()
+            return
+        self._finish_walk_task()
+
+    def _cancel_walk(self, play_task=True):
+        """中止这趟"走过去"（用户拖它 / 改大小 / 被别的动作顶掉）。
+
+        `play_task=True` 时把本来要做的那个动作直接放出来 —— 主人点了动作、
+        走到一半被抓起来，也照样能看到它做，不白点一下。
+        """
+        task = getattr(self, "_walk_task", None)
+        self._walk_task = None
+        self._walk_phase = None
+        self._walk_flip = False
+        self._walk_home = None          # 用户插手了：以他放下的位置为家，别弹回去
+        self.target = None
+        self.cur_speed = 0.0
+        self._stuck_ticks = 0
+        if not getattr(self, "_anim_walking", False):
+            return
+        self._anim_walking = False
+        if not (play_task and task):
+            return
+        clip, loop = task
+        # 用户接手了：**家 = 现在**。不这么改的话，下面 play() 触发的窗口重排
+        # 会按走位前的旧"家"摆位置 —— 走到一半被抓住，窗口先瞬移回出发地一带
+        # （实测跳 48~180px），然后才跟上鼠标，这就是"拖动时位置错乱"。
+        self._anim_home = (self.x() + self.width() / 2,
+                           self.y() + self.height())
+        # 顺手让散步歇一会儿：不然 target 一清，自由散步下一帧就自己挑目标开走，
+        # 用户还按着鼠标呢，桌宠先从他手底下溜了。
+        try:
+            self.rest_until = self.t * self.tick_ms + random.randint(2000, 6000)
+        except Exception:
+            pass
+        # 同样一帧到位：走路时窗口是窄的，动作要的宽度一次给足，别慢慢撑开
+        self._anim_snap_size = True
+        # 用户正抓着：这次重排别夹屏幕（贴边抓住时窗口一长大就被往里夹，鱼会
+        # 挣脱鼠标跳 50~100px）。窗口先探出屏幕一点，松手吸附再收回。
+        self._anim_snap_noclamp = True
+        try:
+            self.ext["anim"].player.play(clip, loop=loop, restart=True)
+        except Exception as exc:
+            print("[anim] 中止走路后播动作失败:", exc)
+        finally:
+            self._anim_snap_size = False
+            self._anim_snap_noclamp = False
+            self.update()
+
+
+    # --- 几何平滑过渡 -----------------------------------------------------
+    def _geom_glide_running(self):
+        a = getattr(self, "_geom_anim", None)
+        return a is not None and a.state() == QAbstractAnimation.State.Running
+
+    def _geom_glide(self, w, h, x, y, ms=0):
+        """缓动到目标几何（宽高 + 位置一起插值）。
+
+        现在只管**原地张开 / 收窄**：200ms 快出慢停，像原地伸了个懒腰。
+        "要挪位置"不归它管了 —— 那件事交给散步引擎（见 `_anim_walk_to_clip`），
+        窗口跟着 `tick()` 的位移走，不再有第二条缓动曲线。
+
+        真到了"要挪又没有走路动作"的极端情况（素材被删），这里仍按
+        `GLIDE_SPEED` 折算时长慢慢滑过去，总比瞬移强。
+        """
+        cur = (self.width(), self.height(), self.x(), self.y())
+        tgt = (int(w), int(h), int(x), int(y))
+        if cur == tgt:
+            self._anim_cmd = tgt
+            return
+        # 判断"有没有真的挪地方"要看中心和底边，不能看左上角 —— 原地变宽时
+        # 左上角也会平移半个宽度，但鱼根本没动，那种情况不该踮脚也不该拖时长。
+        dcx = abs((tgt[2] + tgt[0] / 2) - (cur[2] + cur[0] / 2))
+        dbottom = abs((tgt[3] + tgt[1]) - (cur[3] + cur[1]))
+        moving = (dcx + dbottom) > 1
+        if ms <= 0:
+            if moving:
+                ms = int(min(GLIDE_MAX_MS,
+                             max(GLIDE_MIN_MS,
+                                 (dcx + dbottom * 0.6) * 1000.0 / GLIDE_SPEED)))
+            else:
+                ms = 200
+        if getattr(self, "_geom_anim", None) is None:
+            self._geom_anim = QVariantAnimation(self)
+            self._geom_anim.setStartValue(0.0)
+            self._geom_anim.setEndValue(1.0)
+            self._geom_anim.valueChanged.connect(self._geom_glide_step)
+            self._geom_anim.finished.connect(self._geom_glide_done)
+        self._geom_anim.stop()
+        self._geom_from = cur
+        self._geom_to = tgt
+        self._geom_lift = 0
+        # 只变大：快出慢停（弹一下）；真要挪（兜底）就慢起慢停
+        self._geom_anim.setEasingCurve(
+            QEasingCurve.Type.InOutCubic if moving else QEasingCurve.Type.OutCubic)
+        self._geom_anim.setDuration(max(1, int(ms)))
+        self._geom_anim.start()
+
+    def _geom_glide_step(self, v):
+        f, t = self._geom_from, self._geom_to
+        w = int(round(f[0] + (t[0] - f[0]) * v))
+        h = int(round(f[1] + (t[1] - f[1]) * v))
+        x = int(round(f[2] + (t[2] - f[2]) * v))
+        y = int(round(f[3] + (t[3] - f[3]) * v))
+        self._geom_glide_busy = True       # 这几次移动是动画自己在走，别更新"家"
+        try:
+            if (w, h) != (self.width(), self.height()):
+                # 兜底：正常路径下 `_apply_window_size` 已经把尺寸一帧改到位了，
+                # 走到这里说明是别处直接调了 `_geom_glide` 并带尺寸变化。
+                # 那也一律当帧重画 —— 见 `_apply_window_size` 里 2026-10-25 那段说明：
+                # 只要窗口改宽、画面没跟上，合成器就会把旧画面按新窗口左上角摆出去，
+                # 鱼整体偏 Δw/2 一帧。偏多少只看 Δw，跟"看不看得见"无关。
+                self._set_win_size(w, h, x, y, refresh=True)   # 尺寸+位置一次做完
+            else:
+                self.move(x, y)
+        finally:
+            self._geom_glide_busy = False
+        self._anim_cmd = (x, y, w, h)
+
+    def _geom_glide_done(self):
+        t = self._geom_to
+        self._geom_glide_busy = True
+        try:
+            if (t[0], t[1]) != (self.width(), self.height()):
+                # 同上：收尾这一步如果差得多（中途被顶掉后动画直接跳到终点）也要重画
+                big = (abs(t[0] - self.width()) >= 16 or abs(t[1] - self.height()) >= 16)
+                self._set_win_size(t[0], t[1], t[2], t[3], refresh=big)
+            else:
+                self.move(t[2], t[3])
+        finally:
+            self._geom_glide_busy = False
+        self._geom_lift = 0
+        self._anim_cmd = t
+
+    def moveEvent(self, e):
+        """记"家"：除了自己的动画，任何移动（用户拖、恢复位置、吸附、改大小）
+        都把"家"更新到新位置 —— 换动作时就从这儿长出去、做完了回到这儿。
+
+        ⚠️ "去那儿做动作"那一趟（`_anim_walking`）**不更新家**：家要留在原地，
+        否则走过去之后"家"也跟着挪了，做完动作就回不去了。
+        """
+        super().moveEvent(e)
+        if getattr(self, "_geom_glide_busy", False):
+            return
+        if getattr(self, "_anim_walking", False):
+            return
+        if getattr(self, "skin", None) == SKIN_ANIM:
+            self._anim_home = (self.x() + self.width() / 2, self.y() + self.height())
+
+    def _stop_geom_glide(self):
+        """用户插手了（拖它 / 改大小 / 重新摆位）：别跟人家抢窗口。
+
+        正在"走过去"就到此为止 —— 但那个动作照播（`_cancel_walk(play_task=True)`），
+        主人点了动作、走到一半把它抓起来，也照样能看到它做，不白点一下。
+        """
+        a = getattr(self, "_geom_anim", None)
+        if a is not None and a.state() == QAbstractAnimation.State.Running:
+            a.stop()
+        lift = getattr(self, "_geom_lift", 0)
+        if lift:
+            self._geom_lift = 0
+            self.move(self.x(), self.y() + lift)
+        if getattr(self, "_anim_walking", False) or getattr(self, "_walk_task", None):
+            self._cancel_walk(play_task=True)
+
+    def _anim_dy_now(self):
+        """当前该补的垂直偏移（输出画布像素，负数=往上提）；切动作时 0.22 秒渐变过去。"""
+        to = getattr(self, "_anim_dy_to", 0)
+        frm = getattr(self, "_anim_dy_from", 0)
+        if to == frm:
+            return to
+        t0 = getattr(self, "_anim_dy_t0", 0.0)
+        p = (time.perf_counter() - t0) / 0.22
+        if p >= 1.0:
+            self._anim_dy_from = to
+            return to
+        if p <= 0.0:
+            return frm
+        e = 1 - (1 - p) ** 3
+        return frm + (to - frm) * e
+
+    def _calc_window_size(self, quantize=False, canvas=None):
+        """算出该用的窗口尺寸 (w, h)，**不动窗口**。
 
         为什么要有个最窄宽度：新加的「迷你 / 特小」两档精灵很窄（几十像素），
         如果窗口跟着一起变窄，余额气泡就会被挤成一列竖着的字。
+
+        `canvas=(w, h)` 可以指定"按哪段动作的画布算"，不给就问播放器当前这段。
+        走路编排要用：得先知道「走路」那段的窗口多宽 —— 总不能为了问一句先切过去播一下。
+
+        身体区高用 `_body_h()`（灵动版比 cur_h 高一点），其余形象和以前完全一样。
         """
-        try:
-            spec_w = max(p.width() for k, p in self.sprites.items() if k[1] == self.cur_h)
-        except ValueError:
-            spec_w = 0
-        self.win_mx = int(self.cur_h * 0.062) + 6
-        self.win_w = max(spec_w + self.win_mx * 2, MIN_WIN_W)
-        self.setFixedSize(self.win_w, self.cur_h + BUBBLE_H + MARGIN * 2 + 10)
+        body = self._body_h()
+        # 算窗口尺寸时用**浮点** body：`_body_h()` 是 int（绘制要用整数），
+        # 而拖滑块时 cur_h 每步 +1.27，int 截断会把它放大成"这一步 +1、下一步 +2"，
+        # 再乘 1.18 和画布宽高比，窗口宽度就出现 3~4px 的台阶。用浮点算、最后 round，
+        # 相邻两步稳定只差 1~2px。
+        body_f = self.cur_h * ANIM_BODY_ZOOM if self.skin == SKIN_ANIM else float(body)
+        if self.skin == SKIN_ANIM:
+            # ⚠️ 2026-10-25：窗口宽度**固定成所有动作里最宽的画布**，不再跟着当前动作变。
+            #
+            # 为什么（240fps 录屏实锤）：换动作时窗口宽度一变，合成器会把**旧画面**
+            # 按新窗口的左上角摆出去 —— 鱼整体偏 Δw/2，240fps 下能占到 2 帧
+            # （实测 6.9173~6.9224 偏 −224px，正好是 待机298→水枪689 那 460px 的一半）。
+            # `refresh=True` 拦不住：它是在改完尺寸之后同步重画，旧表面已经被取走了。
+            # 只要窗口的 x 跟着宽度走，这个偏移就躲不掉 —— 唯一根治办法是不改宽度。
+            #
+            # 代价：窗口比窄动作宽（最宽 689、最窄 298）。但半透明窗口里 alpha=0 的
+            # 区域不接收鼠标（实测 `_test/_probe_hit.py`），所以不会挡住下面的点击；
+            # 贴边吸附改成按"鱼的可见宽度"算（见 `_content_margin`），观感不变。
+            spec_w = 0.0
+            try:
+                mw, mh = self.ext["anim"].player.max_canvas()
+                spec_w = mw * body_f / max(1, mh)
+            except Exception:
+                pass
+        else:
+            try:
+                spec_w = max(p.width() for k, p in self.sprites.items() if k[1] == self.cur_h)
+            except ValueError:
+                spec_w = 0
+        # 留白也不要提前取整，同上。
+        self.win_mx = body_f * 0.062 + 6
+        w = max(spec_w + self.win_mx * 2, MIN_WIN_W)
+        h = body_f + BUBBLE_H + MARGIN * 2 + 10
+        # 2026-10-24：不再按档取整（见 _apply_window_size 的注释），尺寸精确到像素。
+        return int(round(w)), int(round(h))
+
+    def _set_win_size(self, w, h, x=None, y=None, refresh=False):
+        """改窗口尺寸（可选连位置一起改）—— 一律走这里，别直接调 setFixedSize。
+
+        实测（`_test/measure_resize.py`，真 Windows 平台、60 次、透明无边框窗口）：
+
+            只 resize                约 4.6ms
+            只 setFixedSize          约 4.1~5.0ms
+            resize 再 move（两次）   约 5.8~6.4ms
+            **setGeometry（一次）    约 4.2ms**
+
+        结论：① setFixedSize 并不比 resize 快（上一版量出"快 20 倍"是假的 ——
+        当时先用 setFixedSize 锁死了 min=max，后面的 resize 全被 clamp 掉，等于空操作）；
+        ② 但"改尺寸 + 挪位置"合进一次 setGeometry 能省掉单独 move 的 1.7ms，
+        拖滑块时每步都要做，值得。
+
+        `refresh=True`：改完**当帧**同步重画一次。
+        只有"一帧里宽度大变"的场合需要它（走路到位接动作：337 → 705）。
+        为什么（2026-10-24 主人报的"向左瞬移一下再闪回"）：窗口的客户区先变了、
+        内容还是旧的一帧，合成器会把旧画面按新窗口摆出去 —— 窄画面塞进宽窗口，
+        鱼看着往左跳了半个宽度，下一帧重画又弹回来。同步 repaint 一下就没这一帧。
+        （上一版用 `setUpdatesEnabled(False)` 包着改，等于保证中间不重画，反而必现。）
+        """
+        w, h = int(w), int(h)
+        if not getattr(self, "_size_unfixed", False):
+            self.setMinimumSize(1, 1)
+            self.setMaximumSize(16777215, 16777215)
+            self._size_unfixed = True
+        if x is None or y is None:
+            self.resize(w, h)
+        else:
+            self.setGeometry(int(x), int(y), w, h)
+        if refresh:
+            self.repaint()
+
+    def _apply_window_size(self, quantize=False, anchor=None):
+        """按当前档位摆好窗口：精灵宽度 + 两边留白，但不小于 MIN_WIN_W（气泡要放得下字）。
+
+        `anchor=(x, y, w, h)`：改尺寸**之前**的位置和大小。给了就顺手把窗口摆到
+        "中心不动、脚底不动"的新位置，一次 `setGeometry` 完成 —— 见 `_set_win_size`。
+
+        ⚠️ `quantize` 现在是个空参数（2026-10-24 起）：以前拖滑块时把尺寸取整到
+        48px 一档，想少重建几次窗口。但它没算到贵的其实是每次 `move`（1.7ms），
+        而窗口一格一格跳反而让画面突然"变清晰一下"（实测帧滞后中位 76px）。
+        现在尺寸精确到像素，参数留着只为不动调用点。
+        """
+        w, h = self._calc_window_size(quantize)
+        self.win_w, self.win_h = w, h
+        if anchor and anchor[2]:
+            nx = int(anchor[0] + anchor[2] / 2 - w / 2)
+            ny = int(anchor[1] + anchor[3] - h)
+            cur = (self.width(), self.height(), self.x(), self.y())
+            if (w, h, nx, ny) != cur:
+                # 拖滑块时鼠标能报 125 次/秒，而每次改窗口要 4.2ms —— 每次都改会
+                # 把主线程占满（125 × 4.2 = 525ms/秒）。所以按时间节流：
+                # 至少隔 DRAG_RESIZE_GAP 才动一次窗口，节奏跟重绘（约 19ms）对齐。
+                # 但差值很大（快速拖动）时立刻跟，别让窗口明显落在后面。
+                d = max(abs(w - cur[0]), abs(h - cur[1]),
+                        abs(nx - cur[2]), abs(ny - cur[3]))
+                now = time.perf_counter()
+                if (not quantize or d >= DRAG_RESIZE_JUMP
+                        or now - getattr(self, "_win_size_at", 0.0) >= DRAG_RESIZE_GAP):
+                    self._set_win_size(w, h, nx, ny)
+                    self._win_size_at = now
+        elif (w, h) != (self.width(), self.height()):
+            self._set_win_size(w, h)
+
+    def _schedule_size_settle(self):
+        """拖完大小之后，把窗口从"量化档"收回到精确尺寸。"""
+        if not hasattr(self, "_size_settle_timer"):
+            self._size_settle_timer = QTimer(self)
+            self._size_settle_timer.setSingleShot(True)
+            self._size_settle_timer.timeout.connect(self._settle_window_size)
+        self._size_settle_timer.start(320)
+
+    def _settle_window_size(self):
+        """松手后的一次收尾：窗口回到精确尺寸（脚底和中心不动）。"""
+        old_x, old_y = self.x(), self.y()
+        old_w, old_h = self.width(), self.height()
+        self._apply_window_size()
+        if old_w:
+            self.move(int(old_x + old_w / 2 - self.width() / 2),
+                      int(old_y + old_h - self.height()))
+        self._settle()
 
     def snap_into_screen(self):
-        geo = (self.screen() or QApplication.primaryScreen()).availableGeometry()
-        x = max(geo.left(), min(geo.right() - self.width(), self.x()))
+        """把窗口夹回屏幕内。只有真越界才动窗口 ——
+        实测 move 一次要 1.7ms（真机），拖滑块时每步都白付一次就白掉 25% 预算。
+
+        多屏（2026-10-25）：跟随模式下按**光标那块屏**夹（`_move_geo`），
+        否则它刚跨到副屏就被这条拽回原来那块屏，看着像"过不去"。
+        """
+        geo = self._move_geo()
+        m = self._content_margin()
+        x = max(geo.left() - m, min(geo.right() - self.width() + m, self.x()))
         y = max(geo.top(), min(geo.bottom() - self.height(), self.y()))
-        self.move(x, y)
+        if (x, y) != (self.x(), self.y()):
+            self.move(x, y)
         self._settle(geo)
 
     def _keep_on_top(self):
@@ -9996,6 +12017,16 @@ def main():
             w.raise_()
             w.say("我在这儿呢，有我这只就够啦")
         server.newConnection.connect(on_new_connection)
+
+    # 启动期产生的对象一并"冻结"进永久代：以后每轮全量 GC 不用再扫它们。
+    # 这是个长跑的常驻程序，不这么做的话拖大小滑块时偶尔会撞上一次全量回收，
+    # 实测能抖出 60~70ms 的卡顿（2026-10-23 排查"调整尺寸卡顿"时量到的）。
+    try:
+        import gc
+        gc.collect()
+        gc.freeze()
+    except Exception:
+        pass
 
     sys.exit(app.exec())
 

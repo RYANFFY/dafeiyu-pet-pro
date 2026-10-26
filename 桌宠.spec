@@ -6,6 +6,13 @@ import shiboken6
 from PyInstaller.utils.hooks import collect_all
 
 datas = [('sprites', 'sprites'), ('assets', 'assets')]
+# ⚠️ 灵动版（SKIN_ANIM）的帧序列在 sprites_anim/（239MB，8900 多个 webp）。
+# 少了这一行，打出来的安装包里 `anim.py` 会打印「没找到 sprites_anim/manifest.json」
+# 然后退回三视图 —— 新素材 / 原地转头 / 蟹步走位全都没有（2026-10-27 查出来的）。
+if os.path.isdir('sprites_anim'):
+    datas += [('sprites_anim', 'sprites_anim')]
+else:
+    print('[spec] 警告：没有 sprites_anim/，这次打出来的包只有三视图模式')
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('requests')
