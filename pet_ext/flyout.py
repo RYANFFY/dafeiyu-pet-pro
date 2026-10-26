@@ -47,15 +47,15 @@ except Exception:                       # 界面模块没起来也要能用（�
 # 确实压人。现在按鱼的宽高按比例算，再夹在下面这个范围里。
 W_DEFAULT = 300          # 兜底宽（算不出来时用）
 H_DEFAULT = 380          # 兜底高
-W_MIN, W_MAX = 260, 340  # 宽度范围（W_MIN 也是"旁边放不下时"能收到的最窄）
-H_MIN, H_MAX = 320, 420  # 高度范围
+W_MIN, W_MAX = 200, 340  # 宽度范围（跟着鱼**本体**走；200 是"鱼很小"时的下限）
+H_MIN, H_MAX = 240, 420  # 高度范围
 W_RATIO, H_RATIO = 1.45, 1.35   # 相对鱼的宽 / 高
 MARGIN = 10              # 四周留白：画"假阴影"和尖角用，窗口本身是透明的
 GAP = 2                  # 和**鱼**之间的空隙（不是和窗口）
 SLIDE_MS = 170           # 滑出 / 滑回时长
 FOLLOW_MS = 60           # 跟随时重新对位的间隔
 FOLLOW_EPS = 2           # 位置差这么点就别动了（省得每 60ms 都 move 一次）
-MIN_W = 260              # 旁边放不下时最窄收这么宽（再窄输入框就不好用了）
+MIN_W = 200              # 旁边放不下时最窄收这么宽（再窄输入框就不好用了）
 RADIUS = 14.0            # 卡片圆角（正常状态）
 MORPH_MS = 320           # 从圆形长成卡片的时间（240 有点急，主人说"太生硬"）
 # 尖角（气泡尾巴）：2026-10-26 主人说"三角形和聊天框衔接不够自然"。
@@ -121,6 +121,27 @@ class _Bubble(QLabel):
             self.setStyleSheet(
                 f"QLabel {{ background: {t['surface_alt']}; color: {t['text']};"
                 f" border-radius: 10px; padding: {pad}; }}")
+
+
+class _ChipBox(QWidget):
+    """那排 chip 的容器：**宽度不许影响整块板子的宽度**。
+
+    为什么需要它：QWidget 的最小宽度来自布局，布局的最小宽度来自每个 QPushButton 的
+    minimumSizeHint（含文字宽度）。所以只要这排按钮存在，板子的最小宽度就被顶到
+    336（鱼才 155~217 宽），布局锁住之后 `_place()` 的 resize 压不回来 ——
+    板子比鱼还宽，贴上去就盖住鱼（主人 2026-10-27）。
+    把 minimumSizeHint / sizeHint 的宽度改成 0，宽度就只由 `_place()` 说了算。
+    ⚠️ 别改用 `QSizePolicy.Ignored`：那样内层布局会把按钮压成**宽度 0**（整排直接看不见，
+    主人 2026-10-27 报的「交给谁全部消失」就是这个）。按钮的宽度由 `_fit_chips()` 明确给。
+    """
+
+    def minimumSizeHint(self):          # noqa: N802
+        s = super().minimumSizeHint()
+        return QSize(0, s.height())
+
+    def sizeHint(self):                 # noqa: N802
+        s = super().sizeHint()
+        return QSize(0, s.height())
 
 
 class FlyoutWindow(QWidget):
@@ -244,14 +265,10 @@ class FlyoutWindow(QWidget):
         lay.addWidget(self.subtitle)
 
         # 一排小按钮（派活用：Codex / DSH / 只打开）。没设就整排不占地方。
-        self.actions_box = QWidget(self.card)
+        self.actions_box = _ChipBox(self.card)
         # ⚠️ 2026-10-27 主人：「派活界面加载的文案信息会让窗口越来越长会挡道桌宠」。
-        # 真凶是这排 chip 的 sizeHint 会把整块板子的**最小宽度**顶上去（实测 260 → 336）：
-        # 布局的 minimumSize 一旦变大，`_place()` 里那个 resize 就压不回来了 ——
-        # 板子比鱼宽出一大截，贴到鱼边上就把它盖住了。
-        # 所以这里让它的宽度**不参与**布局计算（Ignored），宽度只由 `_place()` 说了算；
-        # 真放不下时按钮自己收窄（`setMinimumWidth(0)`），文字用省略号截（见 _fit_chips）。
-        self.actions_box.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        # 真凶是这排 chip 的 sizeHint 会把整块板子的**最小宽度**顶上去（实测 260 → 336）。
+        # 用 `_ChipBox` 把它的宽度贡献清零，按钮宽度由 `_fit_chips()` 明确给。
         self.actions_row = QHBoxLayout(self.actions_box)
         self.actions_row.setContentsMargins(0, 0, 0, 0)
         self.actions_row.setSpacing(6)
@@ -263,6 +280,12 @@ class FlyoutWindow(QWidget):
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # ⚠️ 最小尺寸放 0：状态行 / 停止键 / chip 出现时，让消息区**自己让位**，
+        # 而不是把整块板子顶高（主人 2026-10-27：「文案会让窗口越来越长」）。
+        # 只写 setMinimumHeight(0) 不够 —— 布局在"没显式设过"时会退回 minimumSizeHint（实测 54），
+        # 所以这里用 setMinimumSize(0, 0) + Ignored 策略。
+        self.scroll.setMinimumSize(0, 0)
+        self.scroll.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.body = QWidget()
         self.body.setObjectName("body")
         self.msgs = QVBoxLayout(self.body)
@@ -290,10 +313,15 @@ class FlyoutWindow(QWidget):
         self.btn_stop.setObjectName("mini")
         self.btn_stop.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_stop.setToolTip("停掉正在跑的 Agent 任务")
+        # ⚠️ 高度钉死：按钮比那行小字高 8px，一出现就把整块板子撑高 8px
+        # （主人 2026-10-27：「文案会让窗口越来越长」的另一种表现）。
+        self.btn_stop.setFixedHeight(18)
         self.btn_stop.clicked.connect(self._on_stop)
         self.btn_stop.hide()
         _srow.addWidget(self.btn_stop, 0)
         self.status_row.hide()
+        # 高度钉死：有没有「停止」键都是这么高，不许把板子顶高（见上面 btn_stop 的注释）
+        self.status_row.setFixedHeight(24)
         lay.addWidget(self.status_row)
 
         # 输入行
@@ -668,8 +696,6 @@ class FlyoutWindow(QWidget):
             b.setObjectName("chipOn" if on else "chip")
             b._dfy_text = text                  # 原文留着，窄的时候按它截（见 _fit_chips）
             b.setCursor(Qt.CursorShape.PointingHandCursor)
-            b.setMinimumWidth(0)
-            b.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
             b._dfy_cb = cb
             b.clicked.connect(cb)
             self.actions_row.addWidget(b)
@@ -704,13 +730,13 @@ class FlyoutWindow(QWidget):
         for b in btns:
             b.setToolTip(b._dfy_text)        # 截了就靠 tooltip 看全文
         if sum(hints) <= avail:
-            for b in btns:
-                b.setMaximumWidth(16777215)
+            for b, h in zip(btns, hints):
+                b.setFixedWidth(max(40, h))
                 b.setText(b._dfy_text)
             return
         per = max(46, avail // len(btns))
         for b in btns:
-            b.setMaximumWidth(per)
+            b.setFixedWidth(per)
             fm = b.fontMetrics()
             b.setText(fm.elidedText(b._dfy_text, Qt.TextElideMode.ElideRight,
                                     max(24, per - 14)))
@@ -912,11 +938,18 @@ class FlyoutWindow(QWidget):
         # 鱼只占中间两百来像素。按窗口摆的话，板子离鱼还空着一大截
         # —— 主人 2026-10-26 说的「太远了」就是这个。
         try:
-            _local = self.pet.sprite_rect()
+            # 用**鱼本体**（有像素的那块），不是画布：画布四周有透明留白，
+            # 按画布摆会"离得太远"，画布比鱼窄时又会压到头发（主人 2026-10-27）。
+            _local = self.pet.sprite_body_rect()
             pet = QRect(pet.x() + _local.x(), pet.y() + _local.y(),
                         _local.width(), _local.height())
         except Exception:
-            pass
+            try:
+                _local = self.pet.sprite_rect()
+                pet = QRect(pet.x() + _local.x(), pet.y() + _local.y(),
+                            _local.width(), _local.height())
+            except Exception:
+                pass
 
         room_right = geo.right() - (pet.right() + GAP) + 1
         room_left = (pet.left() - GAP) - geo.left()
@@ -932,8 +965,14 @@ class FlyoutWindow(QWidget):
         # （主人报的「把桌宠挡住了」）。改成"绝不超过空位"，宁可窄一点。
         w = max(140, min(want_w, room, geo.width()))
         h = min(want_h, geo.height())
-        if apply and (w, h) != (self.width(), self.height()):
-            self.resize(w, h)
+        if apply:
+            # ⚠️ 加个死区：鱼换动作时窗口/画布会差十几像素，跟着改就会**一直抽**
+            # （主人 2026-10-27：「较小……仍会挡住」「放大后又离得太远」有一部分就是它）。
+            # 只有真的改了大小时（滑块 / 换档，一档差几十像素）才跟着变。
+            if abs(w - self.width()) >= 24 or abs(h - self.height()) >= 24:
+                self.resize(w, h)
+            else:
+                w, h = self.width(), self.height()
 
         x = pet.right() + GAP if side == "right" else pet.left() - GAP - w
         y = pet.top() - 14                          # 卡片顶比鱼头高一点点，别顶到眼睛

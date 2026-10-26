@@ -11011,6 +11011,58 @@ class PetWindow(QWidget):
         key = self._sprite_key()
         return bool(key and self.sprites.get((key[0], key[1])))
 
+    def sprite_body_rect(self):
+        """鱼**真正有像素**的那块（窗口坐标），比 `sprite_rect()` 紧一圈。
+
+        主人 2026-10-27：「聊天ui……放大后又离得太远」。`sprite_rect()` 给的是**画布**
+        （idle 那段 238 宽），画布左右各有透明留白，鱼本体比它窄 —— 浮窗贴着画布边摆，
+        视觉上就离鱼远了一截；反过来，画布比鱼窄的动作，贴画布摆又会压到头发。
+
+        ⚠️ 只在 **idle** 上量一次，之后所有动作都套用这个比例：
+        每段动作的画布宽窄差很多（idle 238 / 水枪 689），跟着当前帧量的话，
+        浮窗会**随动作左右乱跳**（第 41 轮踩过：切动作时板子忽远忽近）。
+        idle 是她站着的样子，拿它当锚点最稳。
+        """
+        base = self.sprite_rect()
+        try:
+            if self.skin != SKIN_ANIM:
+                return base
+            frac = getattr(self, "_body_frac", None)
+            if frac is None:
+                _pl = getattr(getattr(self, "ext", {}).get("anim"), "player", None)
+                pix = _pl.current() if _pl is not None else None
+                if (pix is not None and not pix.isNull() and pix.height()
+                        and getattr(_pl, "clip", "") == "idle"):
+                    img = pix.toImage()
+                    step = 3
+                    x0, y0, x1, y1 = img.width(), img.height(), -1, -1
+                    for y in range(0, img.height(), step):
+                        for x in range(0, img.width(), step):
+                            if (img.pixel(x, y) >> 24) & 0xFF > 8:
+                                if x < x0:
+                                    x0 = x
+                                if x > x1:
+                                    x1 = x
+                                if y < y0:
+                                    y0 = y
+                                if y > y1:
+                                    y1 = y
+                    if x1 > x0 and y1 > y0:
+                        frac = (x0 / float(img.width()), y0 / float(img.height()),
+                                (x1 + step) / float(img.width()),
+                                (y1 + step) / float(img.height()))
+                        self._body_frac = frac
+            if not frac:
+                return base
+            fx0, fy0, fx1, fy1 = frac
+            return QRect(
+                int(round(base.x() + base.width() * fx0)),
+                int(round(base.y() + base.height() * fy0)),
+                max(8, int(round(base.width() * (fx1 - fx0)))),
+                max(8, int(round(base.height() * (fy1 - fy0)))))
+        except Exception:
+            return base
+
     def restart_pet(self):
         """一键重启：改完代码不用手动关掉再双击脚本。
 

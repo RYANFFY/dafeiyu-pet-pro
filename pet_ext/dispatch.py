@@ -177,6 +177,20 @@ class CliAdapter(Adapter):
                 f"（上面都是完整路径，直接按路径读；别递归扫描整个磁盘去找，"
                 f"找不到就直说。做完用一两句话说明结果。）")
 
+    def ui_cmd(self):
+        """「在它里面打开看成果」用的命令行：**交互模式**，不带 headless 那套参数。
+
+        主人 2026-10-27：「派活应该是正好想做个东西，但不想手动打开 dsh，
+        需要做完返回后有入口打开 dsh 直接看成果，而不是只能在对话框里」。
+        所以跑完之后给一颗「看成果」，在新控制台里、**在同一个工作目录**下把 Agent
+        本体打开（配置里 `ui` 字段可以指定交互模式的参数，不写就只跑 cmd 本身）。
+        """
+        parts = _wrap(self.spec.get("cmd") or self.key)
+        extra = str(self.spec.get("ui") or "").strip()
+        if extra:
+            parts = parts + split_args(extra)
+        return parts
+
 
 # 「只打开」：不派活，只把文件交给系统默认程序（用户想自己上手时用）。**始终保留。**
 class OpenAdapter(Adapter):
@@ -648,6 +662,23 @@ class DispatchExtension(QObject):
         # stoppable=True：右边露「停止」（2026-10-27 主人要的，原来只能改代码掐任务）
         fly.set_status(text, stoppable=True)
 
+    def _result_actions(self, task):
+        """跑完之后那几颗按钮（chip 和"聊天流里那两颗"共用）。
+
+        ⚠️ `clicked` 会塞一个 checked(bool) 进来，lambda 的第一个参数必须拿默认值占位，
+        真参数靠后面的默认值传（2026-10-26 踩过：按钮点了完全没反应）。
+        """
+        acts = [
+            ("输出文件", lambda _=False, p=task.out_path: self.open_path(p)),
+            (f"打开{self._folder_label(task.cwd)}",
+             lambda _=False, p=task.cwd: self.open_path(p)),
+        ]
+        ad = self.agents().get(getattr(task, "agent", ""))
+        if ad is not None and getattr(ad, "can_dispatch", False):
+            # 主人 2026-10-27：跑完要有入口直接进 DSH 看成果，而不是只能在对话框里看几行
+            acts.append(("看成果", lambda _=False, t=task: self.open_agent_ui(t)))
+        return acts
+
     def _announce(self, task, extra=""):
         if task.notified:
             return
@@ -687,20 +718,16 @@ class DispatchExtension(QObject):
                 # （换成整块板子的 chip 就会把「再派一个」糊上来，一点清空聊天记录。）
                 fly.add_with_actions(
                     "note", f"{head} · {label} · 用时 {task.elapsed:.0f} 秒",
-                    [("输出文件", lambda _=False, p=task.out_path: self.open_path(p)),
-                     (f"打开{self._folder_label(task.cwd)}",
-                      lambda _=False, p=task.cwd: self.open_path(p))])
+                    self._result_actions(task))
             else:
-                fly.add("note", f"{head} · {label} · 用时 {task.elapsed:.0f} 秒")
+                # 「再派一个」从 chip 挪到这条消息下面：它一点就 `clear()` 板子，
+                # 放在滚动流里比放在常驻 chip 上安全（也是主人 2026-10-27 提的"挡道"之一）。
+                fly.add_with_actions(
+                    "note", f"{head} · {label} · 用时 {task.elapsed:.0f} 秒",
+                    [("再派一个", lambda _=False, f=task.files: self._open_panel(f))])
             fly.add("her" if ok else "note", tail or "（它没有输出任何内容）")
             if not chatting:
-                fly.set_quick_actions([
-                    # ⚠️ 同上：第一个参数会被 checked(bool) 填掉，函数要拿的实际参数只能靠默认值
-                    ("输出文件", lambda _=False, p=task.out_path: self.open_path(p)),
-                    (f"打开{self._folder_label(task.cwd)}",
-                     lambda _=False, p=task.cwd: self.open_path(p)),
-                    ("再派一个", lambda _=False: self._open_panel(task.files)),
-                ])
+                fly.set_quick_actions(self._result_actions(task))
         if task.state == "cancelled":
             said = "停下了，看旁边"
         else:
@@ -747,14 +774,80 @@ class DispatchExtension(QObject):
                 fly.add("note", f"打不开：{exc}")
             return False
 
+    def open_agent_ui(self, task):
+        """在**新控制台**里打开这个 Agent（工作目录 = 这次派活的工作目录），直接看成果。
+
+        主人 2026-10-27：「派活应该是正好想做个东西，但不想手动打开 dsh，需要做完返回后
+        可以有入口打开 dsh 直接看成果，而不是只能在对话框里」。
+
+        做法：写一个一次性 .bat（cd 到工作目录 → 起交互模式的 Agent → 停下等你按键），
+        再用 `cmd /c start` 弹一个新控制台。为什么走 bat 而不是直接 Popen：
+        路径里有空格 / 中文时，`start` 的引号规则很容易把参数拆坏（踩过），
+        bat 里写清楚最稳。跑完不自动关窗（最后 `pause`），成果留在屏幕上。
+        """
+        ad = self.agents().get(getattr(task, "agent", ""))
+        fly = self._flyout()
+        if ad is None or not hasattr(ad, "ui_cmd"):
+            if fly is not None:
+                fly.add("note", "这个 Agent 没有「在里面打开」的入口。")
+            return False
+        try:
+            parts = ad.ui_cmd()
+        except Exception as exc:
+            if fly is not None:
+                fly.add("note", f"拼不出 {ad.label} 的命令：{exc}")
+            return False
+        cwd = getattr(task, "cwd", "") or os.getcwd()
+        line = " ".join(f'"{p}"' if (" " in p or "\\" in p) else p for p in parts)
+        bat = os.path.join(tempfile.gettempdir(), f"dafeiyu-open-{getattr(task, 'tid', 'x')}.bat")
+        try:
+            with open(bat, "w", encoding="gbk", errors="replace") as f:
+                f.write("@echo off\r\n")
+                f.write(f'cd /d "{cwd}"\r\n')
+                f.write(f"title {ad.label}\r\n")
+                f.write(line + "\r\n")
+                f.write("echo.\r\n")
+                f.write("echo [已退出] 这个窗口可以关掉了\r\n")
+                f.write("pause\r\n")
+            subprocess.Popen(["cmd", "/c", "start", "", bat],
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            return True
+        except Exception as exc:
+            if fly is not None:
+                fly.add("note", f"打不开 {ad.label}：{exc}")
+            return False
+
+    @staticmethod
+    def _kill_tree(proc):
+        """连子进程一起杀。
+
+        ⚠️ 主人 2026-10-27：「我点停下的按钮但是还是做完了」——
+        codex / dsh 是 `cmd.exe` 拉起来的（.cmd 必须过一层 shell），
+        `proc.kill()` 只杀掉那个 cmd，**真正的 node / dsh 进程还在跑**，
+        于是它照样跑完、照样写结果。Windows 上必须 `taskkill /T`（整棵树）。
+        """
+        try:
+            pid = int(proc.pid)
+        except Exception:
+            return
+        if sys.platform == "win32":
+            try:
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)],
+                               capture_output=True,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                return
+            except Exception:
+                pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
     def cancel(self, tid=None):
         """停掉任务（不给 tid 就全停）。"""
         for t in self.tasks.values():
             if t.state == "running" and (tid is None or t.tid == tid):
-                try:
-                    t.proc.kill()
-                except Exception:
-                    pass
+                self._kill_tree(t.proc)
                 t.state = "cancelled"
                 self._announce(t)
 
