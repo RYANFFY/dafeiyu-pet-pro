@@ -245,6 +245,13 @@ class FlyoutWindow(QWidget):
 
         # 一排小按钮（派活用：Codex / DSH / 只打开）。没设就整排不占地方。
         self.actions_box = QWidget(self.card)
+        # ⚠️ 2026-10-27 主人：「派活界面加载的文案信息会让窗口越来越长会挡道桌宠」。
+        # 真凶是这排 chip 的 sizeHint 会把整块板子的**最小宽度**顶上去（实测 260 → 336）：
+        # 布局的 minimumSize 一旦变大，`_place()` 里那个 resize 就压不回来了 ——
+        # 板子比鱼宽出一大截，贴到鱼边上就把它盖住了。
+        # 所以这里让它的宽度**不参与**布局计算（Ignored），宽度只由 `_place()` 说了算；
+        # 真放不下时按钮自己收窄（`setMinimumWidth(0)`），文字用省略号截（见 _fit_chips）。
+        self.actions_box.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.actions_row = QHBoxLayout(self.actions_box)
         self.actions_row.setContentsMargins(0, 0, 0, 0)
         self.actions_row.setSpacing(6)
@@ -640,6 +647,7 @@ class FlyoutWindow(QWidget):
         old = [w for w in old if w is not None]
         if len(old) == len(entries):
             for b, (text, cb, on) in zip(old, entries):
+                b._dfy_text = text
                 b.setText(text)
                 b.setObjectName("chipOn" if on else "chip")
                 prev = getattr(b, "_dfy_cb", None)
@@ -652,18 +660,60 @@ class FlyoutWindow(QWidget):
                 b.clicked.connect(cb)
             self.actions_box.show()
             self.apply_theme()
+            self._fit_chips()
             return
         self._clear_quick_actions()
         for text, cb, on in entries:
             b = QPushButton(text, self.actions_box)
             b.setObjectName("chipOn" if on else "chip")
+            b._dfy_text = text                  # 原文留着，窄的时候按它截（见 _fit_chips）
             b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setMinimumWidth(0)
+            b.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
             b._dfy_cb = cb
             b.clicked.connect(cb)
             self.actions_row.addWidget(b)
         self.actions_row.addStretch(1)
         self.actions_box.show()
         self.apply_theme()          # 新按钮要跟着当前主题上色
+        self._fit_chips()
+        # chip 变了之后，把板子按鱼重新摆一次 —— 不然它可能还留着上一次被撑宽的尺寸
+        if self.isVisible() and self._anim is None:
+            self._target = self._place()[0]
+
+    def _fit_chips(self):
+        """按当前宽度把这排 chip 收窄 / 截字，绝不让它们把窗口顶宽。
+
+        主人 2026-10-27：「文案信息会让窗口越来越长会挡道桌宠」。原来这排按钮的
+        sizeHint 会一路把最小宽度顶到 336（鱼才 155 宽），布局锁住之后 `_place()`
+        的 resize 就压不回来 —— 板子比鱼还宽，贴上去就把鱼盖住了。
+        现在：宽度不参与布局（Ignored）+ 每颗按可用宽度均分 + 文字省略。
+        """
+        btns = []
+        for i in range(self.actions_row.count()):
+            it = self.actions_row.itemAt(i)
+            w = it.widget() if it is not None else None
+            if w is not None and hasattr(w, "_dfy_text"):
+                btns.append(w)
+        if not btns:
+            return
+        gap = 6 * (len(btns) - 1)
+        avail = max(80, self.width() - 2 * MARGIN - 10 - gap)
+        # 先量"原样放得下吗"：放得下就一个字都不截（多数情况就是这条）
+        hints = [b.fontMetrics().horizontalAdvance(b._dfy_text) + 20 for b in btns]
+        for b in btns:
+            b.setToolTip(b._dfy_text)        # 截了就靠 tooltip 看全文
+        if sum(hints) <= avail:
+            for b in btns:
+                b.setMaximumWidth(16777215)
+                b.setText(b._dfy_text)
+            return
+        per = max(46, avail // len(btns))
+        for b in btns:
+            b.setMaximumWidth(per)
+            fm = b.fontMetrics()
+            b.setText(fm.elidedText(b._dfy_text, Qt.TextElideMode.ElideRight,
+                                    max(24, per - 14)))
 
     def _clear_quick_actions(self):
         """清空那排 chip。⚠️ `_dfy_cb` 要一起清，否则复用时会去 disconnect 死对象。"""
@@ -876,7 +926,11 @@ class FlyoutWindow(QWidget):
         # 想要多大：按鱼的比例算（鱼 217 宽 → 板子 315 宽；鱼 155 宽 → 260 宽）
         want_w = max(MIN_W, min(W_MAX, int(pet.width() * W_RATIO)))
         want_h = max(H_MIN, min(H_MAX, int(pet.height() * H_RATIO)))
-        w = min(want_w, max(MIN_W, room), geo.width())
+        # ⚠️ 2026-10-27：原来这里是 `min(want_w, max(MIN_W, room), geo.width())` ——
+        # 那一侧的**空位比 MIN_W 还小**时（鱼贴着屏幕边 / 鱼特别大），宽度会被撑到
+        # 比空位还宽，下面夹屏 `min(x, geo.right()-w+1)` 就把板子**推到鱼身上**了
+        # （主人报的「把桌宠挡住了」）。改成"绝不超过空位"，宁可窄一点。
+        w = max(140, min(want_w, room, geo.width()))
         h = min(want_h, geo.height())
         if apply and (w, h) != (self.width(), self.height()):
             self.resize(w, h)
@@ -885,6 +939,26 @@ class FlyoutWindow(QWidget):
         y = pet.top() - 14                          # 卡片顶比鱼头高一点点，别顶到眼睛
         x = max(geo.left(), min(x, geo.right() - w + 1))
         y = max(geo.top(), min(y, geo.bottom() - h + 1))
+
+        # 兜底硬约束：算完要是还压着鱼（浮点误差 / 夹屏），就换到另一侧再试；
+        # 换过去也压着，就只把窗口挪到鱼的上下方 —— **任何情况下都不许盖住鱼**。
+        _w_use = w if apply else self.width()
+        _h_use = h if apply else self.height()
+        _card = QRect(x + MARGIN, y + MARGIN, _w_use - 2 * MARGIN, _h_use - 2 * MARGIN)
+        if _card.intersects(pet):
+            _other = "left" if side == "right" else "right"
+            _ox = pet.right() + GAP if _other == "right" else pet.left() - GAP - _w_use
+            _ox = max(geo.left(), min(_ox, geo.right() - _w_use + 1))
+            if not QRect(_ox + MARGIN, y + MARGIN,
+                         _w_use - 2 * MARGIN, _h_use - 2 * MARGIN).intersects(pet):
+                x, side = _ox, _other
+            else:
+                _oy = pet.bottom() + GAP
+                if _oy + _h_use > geo.bottom():
+                    _oy = max(geo.top(), pet.top() - GAP - _h_use)
+                y = _oy
+                x = max(geo.left(), min(pet.center().x() - _w_use // 2,
+                                        geo.right() - _w_use + 1))
 
         # 尖角：指回"圆形按钮"的高度（没给就指桌宠身上部三分之一处）
         # ⚠️ 别直接拿打开时记的 `_anchor_y`（屏幕坐标）：鱼会走、会被拖，那个值早就过时了，
@@ -1336,7 +1410,7 @@ class FlyoutWindow(QWidget):
         这里直接同步，视觉上是黏在一起的。
         """
         try:
-            if obj is self.pet and ev.type() == QEvent.Type.Move:
+            if obj is self.pet and ev.type() in (QEvent.Type.Move, QEvent.Type.Resize):
                 if self.isVisible() and self._anim is None and not self._hover:
                     self._on_follow()
         except RuntimeError:
@@ -1352,6 +1426,7 @@ class FlyoutWindow(QWidget):
         except (RuntimeError, AttributeError):
             pass
         self._fit_status()
+        self._fit_chips()
 
     def enterEvent(self, ev):
         """光标进到板子上：停住跟随（否则按钮一直在躲光标，点不中）。"""

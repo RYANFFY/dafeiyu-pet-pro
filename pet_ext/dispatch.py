@@ -551,8 +551,8 @@ class DispatchExtension(QObject):
             # ⚠️ 用户这句**已经**被 `flyout._on_send()` 加进板子了（它先 add 再回调）。
             # 这里再 add 一次的话，浮窗里每条指令都显示两遍（2026-10-26 实测）。
             # 明确写出来"它收到了什么"，省得以为没喂进去（主人 2026-10-26 就怀疑过）。
-            # 工作目录只报文件夹名 —— 完整路径动辄三行，把气泡撑爆（要看全的点「打开工作目录」）
-            folder = os.path.basename(cwd.rstrip("\\/")) or cwd
+            # 工作目录只报文件夹名 —— 完整路径动辄三行，把气泡撑爆（要看全的点按钮）
+            folder = self._folder_label(cwd)
             fly.add("note", f"已交给 {ad.label}：{len(files)} 个文件 + 你这句话。"
                             f"它在「{folder}」里干活，跑完我把结果贴上来。")
             fly.set_status(f"● {ad.label} 已启动，正在跑…")
@@ -618,15 +618,20 @@ class DispatchExtension(QObject):
         fly = self._flyout()
         if fly is None:
             return
-        # ⚠️ 正在聊天时不要往那块板子写「● Codex 正在跑」—— 那是派活状态行，
+        # ⚠️ 正在聊天时**不写**「● Codex 正在跑 · 正在读 xxx」那种派活状态行 ——
         # 糊在聊天框上面会让人以为她的回复卡住了（跑完会在聊天流里补一条结果）。
-        if getattr(fly, "mode", "") == "chat":
-            return
+        # 但「停止」这颗按钮不能跟着消失：主人 2026-10-27 要的就是随时能掐掉任务。
+        # 所以聊天模式下只留一行极短的「● 后台任务 · N 秒」+ 停止。
+        chatting = getattr(fly, "mode", "") == "chat"
         running = [t for t in self.tasks.values() if t.state == "running"]
         if not running:
             fly.set_status("", stoppable=False)
             return
         t = max(running, key=lambda x: x.elapsed)
+        if chatting:
+            more = f"（共 {len(running)} 个）" if len(running) > 1 else ""
+            fly.set_status(f"● 后台任务 · {int(t.elapsed)} 秒{more}", stoppable=True)
+            return
         ad = self.agents().get(t.agent)
         label = ad.label if ad is not None else t.agent
         parts = [f"● {label} 正在跑 · {int(t.elapsed)} 秒"]
@@ -682,16 +687,18 @@ class DispatchExtension(QObject):
                 # （换成整块板子的 chip 就会把「再派一个」糊上来，一点清空聊天记录。）
                 fly.add_with_actions(
                     "note", f"{head} · {label} · 用时 {task.elapsed:.0f} 秒",
-                    [("打开输出文件", lambda _=False, p=task.out_path: self.open_path(p)),
-                     ("打开工作目录", lambda _=False, p=task.cwd: self.open_path(p))])
+                    [("输出文件", lambda _=False, p=task.out_path: self.open_path(p)),
+                     (f"打开{self._folder_label(task.cwd)}",
+                      lambda _=False, p=task.cwd: self.open_path(p))])
             else:
                 fly.add("note", f"{head} · {label} · 用时 {task.elapsed:.0f} 秒")
             fly.add("her" if ok else "note", tail or "（它没有输出任何内容）")
             if not chatting:
                 fly.set_quick_actions([
                     # ⚠️ 同上：第一个参数会被 checked(bool) 填掉，函数要拿的实际参数只能靠默认值
-                    ("打开输出文件", lambda _=False, p=task.out_path: self.open_path(p)),
-                    ("打开工作目录", lambda _=False, p=task.cwd: self.open_path(p)),
+                    ("输出文件", lambda _=False, p=task.out_path: self.open_path(p)),
+                    (f"打开{self._folder_label(task.cwd)}",
+                     lambda _=False, p=task.cwd: self.open_path(p)),
                     ("再派一个", lambda _=False: self._open_panel(task.files)),
                 ])
         if task.state == "cancelled":
@@ -702,6 +709,28 @@ class DispatchExtension(QObject):
         self._play_done(ok)
 
     # ------------------------------------------------------------------ 杂项
+    # 工作目录 → 给人看的短名字。Windows 上桌面文件夹叫 `Desktop`，
+    # 直接显示会让人以为跑错了地方（主人 2026-10-27：「打开工作目录是桌面」——
+    # 其实按设计就是桌面，因为文件本来就在桌面上，只是界面上没说清）。
+    _FOLDER_ALIAS = {"Desktop": "桌面", "Downloads": "下载", "Documents": "文档",
+                     "Pictures": "图片", "Music": "音乐", "Videos": "视频"}
+
+    @classmethod
+    def _folder_label(cls, path):
+        """工作目录 → 短名字（桌面 / 下载 / 临时目录 / 项目名 / D:\\）。"""
+        try:
+            p = os.path.normpath(str(path or ""))
+            name = os.path.basename(p)
+            if not name:                       # 盘符根（D:\）
+                drive = os.path.splitdrive(p)[0]
+                return (drive + "\\") if drive else p
+            _tmp = os.path.normpath(os.environ.get("TEMP") or "")
+            if _tmp and p.lower().startswith(_tmp.lower()):
+                return "临时"
+            return cls._FOLDER_ALIAS.get(name, name)
+        except Exception:
+            return "工作目录"
+
     def open_path(self, path):
         """用系统默认程序打开文件 / 目录。"""
         try:

@@ -34,7 +34,20 @@ def load_config():
             "city": "汕头"
         }
 
-import requests
+# requests 只在联网那几个函数里用（天气 / 余额 / 歌词），但它是启动耗时的大头之一
+# （urllib3 一整套，实测 240ms）。改成第一次真用的时候再导入 —— 用法完全不变
+# （`requests.get(...)` / `requests.exceptions.X` 都能照写）。
+class _LazyRequests:
+    _mod = None
+
+    def __getattr__(self, name):
+        if self._mod is None:
+            import requests as _m
+            type(self)._mod = _m
+        return getattr(self._mod, name)
+
+
+requests = _LazyRequests()
 from PySide6.QtCore import (Qt, QTimer, QPoint, QPointF, QRect, QRectF, QUrl, QIODevice,
                             QEventLoop, QSize, QFileInfo, QEvent, QAbstractNativeEventFilter,
                             QObject, QVariantAnimation, QEasingCurve, QAbstractAnimation)
@@ -7781,7 +7794,13 @@ class PetWindow(QWidget):
         if "idle" not in (pl.manifest.get("clips") or {}):
             return
         old = getattr(self, "_still_side", None)
-        if pl.clip != "idle" and side != old:
+        # ⚠️ 判"正在播一次性动作"必须看**真的有 clip 在播**（`pl.clip` 不是 None）。
+        # 启动那一瞬间 `pl.clip` 还是 None（一帧都没解出来），这时候光标在远处 →
+        # side 从 None 变成 "right" → 旧写法把"空白"当成"动作正在播"，只记状态不动画面；
+        # 之后每 tick 都走"状态没变 → clip 不是 idle → return"，**永远不会起播**。
+        # 表现：窗口出来了、鱼一直是透明的，要等别的动作（走路 / 点击）把它顶活才看得见
+        # —— 主人 2026-10-27 报的「启动显示桌宠速度很慢」就是这个（实测 3 秒以上空白）。
+        if pl.clip is not None and pl.clip != "idle" and side != old:
             # 正在播一次性动作（点了动作 / 通知挥手）：**只记状态，不动画面**。
             # 动作播完 `_anim_after_once` 会按新的 `_still_side` 接回来；
             # 这里要是直接切 idle，动作刚起个头就被顶掉了。
@@ -7796,7 +7815,9 @@ class PetWindow(QWidget):
             # 状态没变，但画面可能被别的动作（点了个动作 / 通知挥手）顶掉了。
             # ⚠️ 正在播一次性动作时**别插手**：播完 `_anim_after_once` 会自己转回这边
             # （不然每 tick 都给它切回 idle，动作刚起个头就没了）。
-            if pl.clip != "idle":
+            # 同上：`pl.clip is None` 是"还没起播"，不能当成"被顶掉了"直接 return，
+            # 否则启动后一直停在空白（见上面那段）。
+            if pl.clip is not None and pl.clip != "idle":
                 return
             # 过渡段 / 来回播的某一段正在播（loop=False）→ **别插手**，
             # 播完 `_still_after_once` 会接力。这里要是重播，画面直接从第 0 帧跳。
