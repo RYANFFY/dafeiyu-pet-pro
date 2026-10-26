@@ -189,6 +189,13 @@ class ChatCircle(QWidget):
         pet = self.ext.pet
         try:
             spr = pet.sprite_rect()
+            # ⚠️ 摆位用**鱼本体**（有像素的那块），不是画布：画布左右有透明留白，
+            # 按画布摆，鱼一放大按钮就"飘在离鱼很远的地方"；鱼很小时又会压到头上
+            # （主人 2026-10-27 两张截图：20% 压头、135% 离得远）。
+            try:
+                body = pet.sprite_body_rect()
+            except Exception:
+                body = spr
             win = pet.rect()
             ready = pet.sprite_ready()
         except Exception:
@@ -199,14 +206,19 @@ class ChatCircle(QWidget):
             return
         if ready:
             self._retries = 0
-        size = max(26, min(self.SIZE, int(spr.width() * 0.30)))
+        # 大小也跟鱼身宽成比例（12%），夹在 20~40：
+        # 20% 档鱼身 53 宽 → 20px（再小就点不中了）；135% 档 357 宽 → 40px。
+        size = max(20, min(40, int(round(body.width() * 0.12))))
         if size != self.width():
             self.setFixedSize(size, size)
-        # 鱼越大按钮越大，但别超过 34、别小于 26。
-        # ⚠️ 要**压住一点头发**：只贴外框（spr.right()）看着是"飘在旁边的另一个东西"，
-        # 压在发梢上才像别在她头上的小徽章（主人 2026-10-26 说"太诡异"就是嫌飘）。
-        cx = spr.right() - int(size * 0.62)
-        cy = spr.top() + int(size * 0.72)
+        if body.width() >= 110:
+            # 鱼够大：压在发梢上，像别在头上的小徽章（主人 2026-10-26 说"太诡异"就是嫌飘）
+            cx = body.right() - int(size * 0.55)
+            cy = body.top() + int(size * 0.60)
+        else:
+            # 鱼很小（20% 那种）：别压在头上，挪到右上外侧一点，谁也不挡谁
+            cx = body.right() + int(size * 0.55)
+            cy = body.top() + int(size * 0.10)
         x = cx - size // 2
         y = cy - size // 2
         x = max(2, min(x, win.width() - size - 2))
