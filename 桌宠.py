@@ -11324,16 +11324,18 @@ class PetWindow(QWidget):
         self.cfg["mode"] = mode
         if mode != "still":
             self._clear_still_side()     # 原地待着的"转头"状态带不走
-            # 吸附只在「原地待着」有意义（见 `_settle`）：切走就**关掉**，
-            # 免得散步/跟随时被一个过期的轴拽回屏幕边（主人 2026-10-27：
-            # 「两个模式下禁用吸附按钮改成关闭状态后不让开启」）。
+            # 吸附只在「原地待着」有意义（见 `_settle` / `_snap_to_edge` 里的
+            # `self.mode != "still"` 判断）：切走就把"吸住的轴"清掉，
+            # 免得散步/跟随时被一个过期的轴拽回屏幕边。
+            #
+            # ⚠️ 这里**只清轴，不许动 `snap_on`**（主人 2026-10-28：
+            # 「重新选择到原地待着的时候，吸附的开关会自己默认为开，不管之前是什么状态」）。
+            # 以前切走时 `set_snap(False)`、切回来又 `set_snap(True)`，等于把主人的选择
+            # 写进配置覆盖掉了。现在 `snap_on` 是**纯用户偏好**，只有设置/菜单里手点才改；
+            # 其它模式下界面**显示成关 + 置灰**（`_sync_snap_switch` 和经典菜单那句
+            # `snap_on and mode == "still"`），真正生效与否由上面那两个函数按 mode 判断。
             self.snap_h = self.snap_v = None
             self.flip_x = False
-            if getattr(self, "snap_on", False):
-                self.set_snap(False)
-        elif not getattr(self, "snap_on", True):
-            # 回到「原地待着」：吸附**自动打开**（主人要的：不然切回来发现吸附没了很怪）
-            self.set_snap(True)
         # 切模式：散步/跟随的走路动画要收干净（不然会侧着身子站在那儿）。
         # 这里不等 crab_out 播完 —— 用户切了模式就该立刻站正。
         if getattr(self, "_amb_phase", None) is not None:

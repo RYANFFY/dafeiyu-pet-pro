@@ -53,6 +53,19 @@ subprocess.Popen([comspec, "/c", f'ping -n 3 127.0.0.1 >nul & start "" "{exe}"']
       `shell=True` / `ping -n 4` / 带重启标记），新增 `--live` 真拉一次临时 .bat 写标记
 - [x] 版本 1.1.7 → **1.1.8**；`README.md` / `README.en.md` 各加一节
 
+### 追加（主人 2026-10-28 02:22）：切回「原地待着」吸附开关不再自己打开
+
+主人原话：「吸附按钮在其他两个移动模式下确实不能开启了，但是重新选择到原地待着的时候，
+吸附的开关会自己默认为开，**不管之前是什么状态**」。
+
+- [x] 根因：第五十八轮在 `set_mode()` 里加了 `set_snap(False)` / `set_snap(True)`，
+      而 `set_snap()` 会写 `cfg["snap_on"]` —— **模式切换把主人的选择覆盖掉了**
+- [x] 改法：`set_mode()` 只清吸附轴（`snap_h / snap_v / flip_x`），一个字节不碰 `snap_on`；
+      生不生效仍由 `_settle()` / `_snap_to_edge()` 里 `self.mode != "still"` 判断（等价）
+- [x] 界面：跟随 / 散步仍显示成关 + 置灰（`_sync_snap_switch`、经典菜单 `snap_on and mode == "still"`），
+      切回原地待着恢复上次的样子；设置页提示补一句「不会自己打开」
+- [x] 自检：`test_snap_edge.py`（13 项，含关着/开着各绕一圈）、`test_new_settings.py` 第 8 节（18 项）全过
+
 ### 自检 / 产物
 
 - [x] `手动测试.bat` → 6：**23 个脚本全绿**（408 个 ✓，EXIT=0）

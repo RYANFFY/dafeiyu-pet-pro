@@ -30,6 +30,10 @@ installer itself can be deleted afterwards.
   program to launch. The whole command is now passed as a single string through the shell; the delay
   before relaunch went from 2s to 3s, and the new instance now waits for the old process to exit
   before deciding "another pet is already running".
+- **Fixed: the snap toggle no longer turns itself on when you switch back to "stay in place".**
+  It used to force "snap to screen edges" on every time you came back from follow-cursor / wander,
+  regardless of your setting. Now it simply remembers what you set: off stays off, on stays on
+  (while in follow / wander it still shows as off and can't be clicked).
 
 ## 🆕 What's new in v1.1.7
 

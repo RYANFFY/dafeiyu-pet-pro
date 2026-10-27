@@ -60,7 +60,34 @@ subprocess.Popen('ping -n 4 127.0.0.1 >nul & start "" "%s"' % exe,
 新：cmd /c "ping -n 4 … & start "" "D:\大肥鱼桌宠\大肥鱼桌宠.exe""     ← 实测能拉起
 ```
 
-### 4. 其它
+### 4. ⭐ 切回「原地待着」时吸附开关不再自己变成开（主人 2026-10-28 追加）
+
+主人原话：「吸附按钮在其他两个移动模式下确实不能开启了，但是重新选择到原地待着的时候，
+吸附的开关会自己默认为开，**不管之前是什么状态**」。
+
+根因是 `set_mode()` 里那两句（第五十八轮加的）：
+
+```python
+if mode != "still":
+    if getattr(self, "snap_on", False):
+        self.set_snap(False)        # 切走：把偏好写成了 false
+elif not getattr(self, "snap_on", True):
+    self.set_snap(True)             # 切回来：又把偏好写成 true
+```
+
+`set_snap()` 会写 `cfg["snap_on"]` —— 也就是说**模式切换把用户的选择覆盖掉了**，
+而不是"临时不生效"。
+
+改法：`set_mode()` **只清吸附轴**（`snap_h / snap_v / flip_x`），一个字节都不碰 `snap_on`。
+真正生不生效由 `_settle()` / `_snap_to_edge()` 里那句 `self.mode != "still"` 判断 ——
+这两处本来就有，所以行为完全等价；界面上的"显示成关 + 置灰"由 `_sync_snap_switch()`
+和经典菜单的 `snap_on and mode == "still"` 负责，切回原地待着就恢复上次的样子。
+
+自检（`_test/test_snap_edge.py`，13 项）：关着 → 跟随/散步 → 回来**还是关着**（配置也是 false）；
+开着 → 绕一圈回来**还是开着**（配置也是 true）；两个模式下 `_settle` / `_snap_to_edge`
+照旧不吸附、吸附轴照旧被清掉。
+
+### 5. 其它
 
 - 版本号 1.1.7 → **1.1.8**；`README.md` / `README.en.md` 各加一节说明。
 - 主人这一轮定的两条工程决定：**拆大文件先不着急**（等下次加功能顺手拆）、
