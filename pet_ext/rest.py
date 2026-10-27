@@ -212,7 +212,12 @@ class RestReminder:
             words = []
         if not words:
             return
+        # 喝水提醒在免打扰 / 全屏期间**不攒**（主人 2026-10-27 定的）：
+        # 免打扰就是为了别被打断，攒一堆"该喝水了"事后一起报更像噪音。
+        # 久坐提醒照旧攒着（那是"你该起来动动"，事后补一句还有用）。
         try:
+            self.pet._say_reminder(random.choice(words), hold=(kind != "water"))
+        except TypeError:                 # 老签名的 `_say_reminder`（万一被降级）
             self.pet._say_reminder(random.choice(words))
         except Exception as exc:
             print("[rest] 提醒没说出来:", exc)
@@ -220,6 +225,10 @@ class RestReminder:
     # ---------------- 手动 / 状态 ----------------
     def breaking(self):
         return self._break_left > 0
+
+    def break_left(self):
+        """休息还剩多少秒（0 = 没在休息）。右键菜单那条「结束休息（还剩 …）」用它。"""
+        return max(0.0, self._break_left)
 
     def start_break(self, minutes=None):
         """「现在休息一下」：手动开始一段休息（这段时间内不再提醒）。"""
@@ -274,7 +283,7 @@ if __name__ == "__main__":
         def lines_for_say(self, key):
             return ["台词"]
 
-        def _say_reminder(self, text):
+        def _say_reminder(self, text, **kw):
             self.said.append(text)
 
         def say(self, *a, **k):

@@ -3356,7 +3356,9 @@ class ConsoleWindow(QWidget):
         page.row(card, "移动方式", "",
                  Segmented([("wander", "自由散步"), ("follow", "跟随鼠标"),
                             ("still", "原地待着")],
-                           pet.mode, lambda key: self._run(pet.set_mode, key)))
+                           pet.mode,
+                           lambda key: (self._run(pet.set_mode, key),
+                                        self._sync_snap_switch())))
         page.row(card, "原地待着时跟随鼠标转向", "仅改变朝向，不移动位置",
                  Switch(pet.still_face_cursor, pet.set_still_face_cursor))
 
@@ -3380,8 +3382,11 @@ class ConsoleWindow(QWidget):
 
         # 从「桌宠形象 → 外观」搬过来的：这两项管的是**拖拽时的行为**，不是外观
         card = page.card("拖拽和吸附", "拖到屏幕边上会自动贴过去", "page.magnet")
-        page.row(card, "拖拽吸附四边", "拖到屏幕边缘时自动吸附",
-                 Switch(pet.snap_on, pet.set_snap))
+        # 吸附只在「原地待着」有意义（主人 2026-10-27：「在选择跟随鼠标和自由行动的
+        # 模式时，不允许打开吸附，不然问题有点多」）—— 其它模式下这个开关是灰的，
+        # 而且真的不生效（见 桌宠.py 的 `_settle` / `_snap_to_edge`）。
+        self.snap_switch = Switch(pet.snap_on, pet.set_snap)
+        page.row(card, "拖拽吸附四边", "拖到屏幕边缘时自动吸附", self.snap_switch)
         page.row(card, "左吸附时翻面", "吸附左侧时朝向屏幕内侧",
                  Switch(pet.flip_on_left, pet.set_flip_on_left))
         # 甩出惯性（GitHub issue #2）：以前松手就瞬移贴边，台词里却喊着「飞起来咯」。
@@ -3389,7 +3394,81 @@ class ConsoleWindow(QWidget):
         page.row(card, "松手甩出去", "甩一下会带着惯性滑一段，停下再吸附",
                  Switch(pet.fling_on, pet.set_drag_fling))
 
+        # ---- 甩出手感：三个可调数值（主人 2026-10-27：「加一个可以自定义的界面，
+        #      数值限定并使用说明」）----
+        # 单独一张卡：上面那张是"开不开"，这张是"开成什么样"，混在一起太长。
+        rng = self.ctx.get("FLING_RANGES") or {"speed": (600, 4000),
+                                               "decay": (1, 8), "bounce": (0, 80)}
+        fp = pet.fling_params()
+        hand = page.card("甩出手感", "甩多快、滑多远、撞边弹多狠（改完立刻生效）",
+                         "page.magnet")
+        bar_speed = page.slider(hand, "甩出力度", "甩得最快能有多快；越大飞得越远",
+                                rng["speed"][0], rng["speed"][1],
+                                int(fp["max_speed"]), " px/s",
+                                lambda v: self._run(pet.set_fling_max_speed, v))
+        bar_decay = page.slider(hand, "惯性衰减", "越大停得越快：1 = 滑最久，8 = 一甩就停",
+                                rng["decay"][0], rng["decay"][1],
+                                int(fp["decay"]), "",
+                                lambda v: self._run(pet.set_fling_decay, v))
+        bar_bounce = page.slider(hand, "撞边反弹", "撞到屏幕边弹回来多少；0 = 撞上就停住",
+                                 rng["bounce"][0], rng["bounce"][1],
+                                 int(round(fp["bounce"] * 100)), " %",
+                                 lambda v: self._run(pet.set_fling_bounce, v))
+        # 滑块 → (控件, 单位)：点「恢复默认」之后要把三个数字拨回去
+        self._fling_sliders = {"speed": (bar_speed, " px/s"),
+                               "decay": (bar_decay, ""),
+                               "bounce": (bar_bounce, " %")}
+        page.buttons(hand, [
+            ("恢复默认", lambda: (self._run(pet.reset_fling_params),
+                                  self._sync_fling_card()),
+             None, "ui.reset")])
+        page.hint(hand, "松手越快甩得越远：力度管上限，衰减管滑多久，反弹管撞边弹多少。"
+                        "默认 2200 / 3 / 45% 大约滑 0.7 秒、400~500 像素。"
+                        "想彻底不要惯性，把上面那张卡的「松手甩出去」关掉就行。")
+        page.hint(card, "吸附只在「原地待着」模式下能用 —— 跟随鼠标 / 自由散步时这个开关是灰的，"
+                        "而且真的不生效（跟随要贴着光标走、散步要自己挑落脚点，一吸附就跟它们打架）。")
+        self._sync_snap_switch()
+        self._hook_page("behavior", self._sync_snap_switch)
+
         self._card_what_it_does(page)
+
+    def _sync_snap_switch(self):
+        """「拖拽吸附四边」跟着移动方式走。
+
+        主人 2026-10-27：「两个模式下禁用吸附按钮改成关闭状态后不让开启，
+        然后回到原地待着模式自动开启」—— 所以这里不只是置灰，还要**显示成关**；
+        切回「原地待着」时 `set_mode()` 会把它自动打开，这边跟着刷新就行。
+        """
+        sw = getattr(self, "snap_switch", None)
+        if sw is None:
+            return
+        still = self.pet.mode == "still"
+        sw.setEnabled(still)
+        sw.setToolTip("" if still else "只在「原地待着」模式下可用")
+        want = bool(self.pet.snap_on) and still
+        if sw.isChecked() != want:
+            sw.blockSignals(True)
+            sw.setChecked(want)
+            sw.blockSignals(False)
+
+    def _sync_fling_card(self):
+        """「甩出手感」三个滑块按配置回拨（点「恢复默认」之后用）。"""
+        try:
+            fp = self.pet.fling_params()
+        except Exception:
+            return
+        want = {"speed": int(fp["max_speed"]), "decay": int(fp["decay"]),
+                "bounce": int(round(fp["bounce"] * 100))}
+        for key, (bar, unit) in (getattr(self, "_fling_sliders", None) or {}).items():
+            v = want.get(key)
+            if v is None or bar.value() == v:
+                continue
+            bar.blockSignals(True)          # 别让 setValue 反过来又写一遍配置
+            bar.setValue(v)
+            bar.blockSignals(False)
+            lbl = getattr(bar, "value_label", None)
+            if lbl is not None:
+                lbl.setText(f"{v}{unit}")
 
     def _card_what_it_does(self, page):
         """「它会做什么」：当前形象能做的动作，能试、能关。

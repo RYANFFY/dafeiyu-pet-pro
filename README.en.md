@@ -42,6 +42,14 @@ with the balance-widget features ported from
   faces you — it only turns, never moves, and never shows its back), turn on
   "原地待着时也跟着鼠标转" in the Mode submenu (off by default)
 - Drag it around (it leans toward the drag direction and says something when you let go)
+- **Throw it**: release while still moving and it flies on with inertia, slows down, **bounces off
+  the screen edge**, and snaps to the edge once it settles. A slow release still snaps immediately.
+  Three knobs under Settings → 动作和互动 → 甩出手感: throw speed 600–4000 px/s (default 2200),
+  inertia decay 1–8 (default 3, higher stops sooner), edge bounce 0–80% (default 45%, 0 = no bounce)
+- **Work / rest reminder** (sedentary + water): **off by default** — nothing runs until you flip the
+  switch in Settings → 应用联动 → 工作与休息. Then it reminds you to get up after N minutes of use
+  (default 45, followed by a quiet break of 5), and to drink water every 60 minutes. If the keyboard
+  and mouse are idle for 3+ minutes it assumes you already took a break and restarts the count.
 - Single click: hop + talk back + refresh the balance
 - Tray icon, always-on-top, click-through mode, start with Windows, settings persisted in `config.json`
 
@@ -50,7 +58,13 @@ with the balance-widget features ported from
 - Balance bubble above its head: `DeepSeek balance / ¥amount / today's spend / current peak or off-peak`
 - Rolling number animation when the balance changes, auto refresh every 60s (click the pet to refresh now)
 - Today's spend is tracked locally from balance drops (no platform token needed), resets daily, ledger in `usage.json`
-- Drag to snap to screen edges (four quarters, corners allowed), flips horizontally when snapped left
+- Drag to snap to screen edges (four quarters, corners allowed), flips horizontally when snapped left.
+  **Only available in "stay in place" mode** — in follow / free-roam mode the switch turns itself
+  off and greys out (can't be enabled), and switches back on automatically when you return to
+  "stay in place", because snapping fights with following the cursor and with picking roaming spots.
+  Snapping measures the **fish's body**, not the window, so the transparent padding no longer leaves
+  a 20–50 px gap between the pet and the screen edge; the speech bubble shifts inward so it never
+  gets clipped by the screen
 - Squash-and-stretch when pressed; keeps its feet on the ground
 - Click sounds: press + release clips merged into one complete sound, played through an always-open audio stream (no clipped first note, rapid clicks overlap)
 - **Peak / off-peak indicator**: weekday 09:00–12:00 and 14:00–18:00 are peak, everything else (lunch break, evenings, weekends all day) is off-peak; three wording styles, and it tells you when the period switches

@@ -766,6 +766,9 @@ MENU_ICONS = (
     ("回收内存", "page.sparkle"),
     ("免打扰", "ui.bell-off"),
     ("结束免打扰", "ui.bell-off"),
+    ("休息一下", "ui.timer"),
+    ("结束休息", "ui.timer"),
+    ("工作与休息", "ui.timer"),
     ("今日汇总", "page.calibrate"),
     ("回收时不动前台程序", "page.sparkle"),
     ("音效选择", "nav.sound"),
@@ -1370,7 +1373,16 @@ FLING_MAX_SPEED = 2200         # 甩太狠也夹一下，别一甩飞出半个�
 FLING_DECAY = 3.0              # 指数衰减（1/s）：越大停得越快
 FLING_DRAG = 320               # 线性减速（px/s²）：保证尾巴真的停住，不无限蹭
 FLING_STOP_SPEED = 55          # 低于这个速度算停了 → 收尾吸附
-FLING_MAX_SECONDS = 1.6        # 兜底：再久也强制停（参数调歪了也不会一直滑）
+FLING_MAX_SECONDS = 2.2        # 兜底：再久也强制停（会弹几下，比不弹要久一点）
+FLING_BOUNCE = 0.45            # 撞边反弹系数（1 = 完全弹性，0 = 贴住不动）
+FLING_MAX_BOUNCE = 8           # 最多弹几下（兜底；正常参数下 3~4 下就停了）
+
+# 界面上三个滑块的取值范围 —— `fling_num()` 夹的也是这一份，改一处就够。
+# 上下限是"还能看"的边界：600 以下甩不动、4000 以上一帧跳半屏（20ms 一帧）；
+# 衰减 1.0 会滑三秒多，8.0 基本是松手就停；反弹超过 0.8 像乒乓球。
+FLING_SPEED_RANGE = (600, 4000)      # 甩出力度（px/s）
+FLING_DECAY_RANGE = (1.0, 8.0)       # 惯性衰减（1/s）
+FLING_BOUNCE_RANGE = (0.0, 0.8)      # 撞边反弹（界面按 0~80% 显示）
 
 
 def fling_velocity(samples, now):
@@ -1403,6 +1415,21 @@ def clamp_fling_speed(vx, vy, vmax=FLING_MAX_SPEED):
         k = vmax / sp
         return vx * k, vy * k
     return vx, vy
+
+
+def fling_num(value, default, low, high):
+    """甩出手感的可调参数：类型不对 / 超范围 / NaN 一律夹回合法范围。
+
+    界面上三个滑块的范围就是这里传的 low~high；手改 config.json 写成 99999
+    也不会让它一甩飞出屏幕外。
+    """
+    try:
+        got = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if got != got:                        # NaN
+        return float(default)
+    return max(float(low), min(float(high), got))
 
 
 def fmt_duration(seconds):
@@ -4693,6 +4720,9 @@ class PetWindow(QWidget):
         self._fling_fx = 0.0          # 滑行中的浮点位置（避免小速度被取整吃掉）
         self._fling_fy = 0.0
         self._fling_t = 0.0           # 已经滑了多久（兜底用）
+        self._fling_decay = FLING_DECAY    # 这一次滑行用的衰减（松手时按配置读一次）
+        self._fling_bounce = FLING_BOUNCE  # 这一次滑行用的反弹系数
+        self._bounces = 0             # 这一把撞了几次边
         self.last_line = ""
         self.last_press_pos = None
 
@@ -5549,11 +5579,18 @@ class PetWindow(QWidget):
 
         免打扰、或者前台是全屏游戏/电影的时候：**这句先攒着**，等结束了再一起汇报；
         平时就交给 `say(queue=True)` —— 前面还有触发类的话在说时依次排着说，不互相盖。
+
+        `hold=False`：这条提醒**不进"攒着"的队列**，闭嘴期间直接丢掉。
+        只给喝水提醒用（主人 2026-10-27 定的）：免打扰就是为了别被打断，
+        结束后再补一句"你该喝水了"更像噪音，不如就算了。
         """
-        if self._hold_now():
+        hold = kw.pop("hold", True)
+        if hold and self._hold_now():
             self._held_lines.append(text)
             del self._held_lines[:-20]        # 攒太多就留最近 20 条
             return
+        if not hold and self._hold_now():
+            return                            # 不攒 = 这段时间就不说了
         self.say(text, queue=True, **kw)
 
     def start_quiet(self, minutes=None):
@@ -6701,6 +6738,40 @@ class PetWindow(QWidget):
                 print("[anim] 切换形象后同步失败:", exc)
 
     # ---------- 拖拽甩出惯性（GitHub issue #2）----------
+    def fling_params(self):
+        """甩出手感的三个可调参数（都夹在 `FLING_*_RANGE` 里）。
+
+        配置键：`fling_max_speed` / `fling_decay` / `fling_bounce`（不写就用默认）。
+        读的时候现夹一次 —— 手改 config.json 写歪了也不会让它一甩飞出屏幕。
+        """
+        return {
+            "max_speed": fling_num(self.cfg.get("fling_max_speed"), FLING_MAX_SPEED,
+                                   *FLING_SPEED_RANGE),
+            "decay": fling_num(self.cfg.get("fling_decay"), FLING_DECAY,
+                               *FLING_DECAY_RANGE),
+            "bounce": fling_num(self.cfg.get("fling_bounce"), FLING_BOUNCE,
+                                *FLING_BOUNCE_RANGE),
+        }
+
+    def set_fling_max_speed(self, value):
+        self.cfg["fling_max_speed"] = int(fling_num(value, FLING_MAX_SPEED,
+                                                    *FLING_SPEED_RANGE))
+
+    def set_fling_decay(self, value):
+        self.cfg["fling_decay"] = int(fling_num(value, FLING_DECAY,
+                                                *FLING_DECAY_RANGE))
+
+    def set_fling_bounce(self, percent):
+        """界面给的是 0~80 的百分数，存成 0~0.8 的系数。"""
+        pct = fling_num(percent, FLING_BOUNCE * 100, 0.0, FLING_BOUNCE_RANGE[1] * 100)
+        self.cfg["fling_bounce"] = round(pct / 100.0, 2)
+
+    def reset_fling_params(self):
+        """「恢复默认」：三个键直接删掉，读的时候自然回默认值。"""
+        for key in ("fling_max_speed", "fling_decay", "fling_bounce"):
+            self.cfg.pop(key, None)
+        self.say("甩出手感恢复默认啦", seconds=2.2, again=True)
+
     def _stop_fling(self):
         """立刻结束惯性滑行（再按住它 / 收尾吸附之前都要先停）。
 
@@ -6709,18 +6780,23 @@ class PetWindow(QWidget):
         self._fling_on = False
         self._fling_vx = self._fling_vy = 0.0
         self._fling_t = 0.0
+        self._bounces = 0
 
     def _start_fling(self, vx, vy):
         """松手时给一个初速度。速度不够 / 开关关着 → 返回 False（走老的"松手即吸附"）。"""
         if not self.fling_on:
             return False
-        vx, vy = clamp_fling_speed(vx, vy)
+        p = self.fling_params()          # 三个手感参数在这里读一次，滑行期间不再读配置
+        vx, vy = clamp_fling_speed(vx, vy, p["max_speed"])
         if math.hypot(vx, vy) < FLING_MIN_SPEED:
             return False
         self._fling_on = True
         self._fling_vx, self._fling_vy = vx, vy
         self._fling_fx, self._fling_fy = float(self.x()), float(self.y())
         self._fling_t = 0.0
+        self._bounces = 0
+        self._fling_decay = p["decay"]      # 这一次滑行用哪套参数（改设置下一把生效）
+        self._fling_bounce = p["bounce"]
         self._fling_need_clip = self.skin == SKIN_ANIM
         return True
 
@@ -6749,7 +6825,7 @@ class PetWindow(QWidget):
         dt = self.tick_ms / 1000.0
         self._fling_t += dt
         geo = (self.screen() or QApplication.primaryScreen()).availableGeometry()
-        k = math.exp(-FLING_DECAY * dt)
+        k = math.exp(-self._fling_decay * dt)
         self._fling_vx *= k
         self._fling_vy *= k
         sp = math.hypot(self._fling_vx, self._fling_vy)
@@ -6763,32 +6839,53 @@ class PetWindow(QWidget):
         self._fling_fx += self._fling_vx * dt
         self._fling_fy += self._fling_vy * dt
 
-        # 夹在屏幕里：撞到哪一边就把那一边的速度清零（沿另一轴继续滑）。
-        # 不做回弹 —— 回弹看着像撞墙，而且会把鱼弹进贴边吸附的死循环。
+        # 夹在屏幕里：撞到哪一边就**反弹**（速度反向乘 `self._fling_bounce`）。
+        # 以前是把那一轴速度清零（贴边滑走），主人 2026-10-27 要"物理反弹"。
+        # 位置同时夹回边界上：20ms 一帧的过冲最多几十像素，夹回来比"按比例退回"更稳，
+        # 也不会因为浮点误差越弹越靠里。
         m = self._content_margin()
         min_x, max_x = geo.left() - m, geo.right() - self.width() + 1 + m
         min_y, max_y = geo.top(), geo.bottom() - self.height() + 1
         hit = False
         if self._fling_fx < min_x:
-            self._fling_fx, self._fling_vx, hit = min_x, 0.0, True
+            self._fling_fx = min_x
+            if self._fling_vx < 0:
+                self._fling_vx = -self._fling_vx * self._fling_bounce
+                hit = True
         elif self._fling_fx > max_x:
-            self._fling_fx, self._fling_vx, hit = max_x, 0.0, True
+            self._fling_fx = max_x
+            if self._fling_vx > 0:
+                self._fling_vx = -self._fling_vx * self._fling_bounce
+                hit = True
         if self._fling_fy < min_y:
-            self._fling_fy, self._fling_vy, hit = min_y, 0.0, True
+            self._fling_fy = min_y
+            if self._fling_vy < 0:
+                self._fling_vy = -self._fling_vy * self._fling_bounce
+                hit = True
         elif self._fling_fy > max_y:
-            self._fling_fy, self._fling_vy, hit = max_y, 0.0, True
+            self._fling_fy = max_y
+            if self._fling_vy > 0:
+                self._fling_vy = -self._fling_vy * self._fling_bounce
+                hit = True
+        if hit:
+            self._bounces += 1
         self.move(int(round(self._fling_fx)), int(round(self._fling_fy)))
 
         sp = math.hypot(self._fling_vx, self._fling_vy)
         if (sp < FLING_STOP_SPEED or self._fling_t >= FLING_MAX_SECONDS
-                or (hit and sp < FLING_MIN_SPEED)):
+                or self._bounces > FLING_MAX_BOUNCE):
             self._finish_fling()
 
     # ---------- 吸附 / 翻转 ----------
     def _snap_to_edge(self):
         """松手后按四分之一区域吸附屏幕四边（角落可组合），左吸附时整体水平翻转。"""
         self._stop_fling()
-        if not self.snap_on:
+        if not self.snap_on or self.mode != "still":
+            # 跟随 / 自由散步不吸附（见 `_settle` 的注释）：连吸附轴都清掉，
+            # 不然切回「原地待着」时会被一个过期的轴拽一下。
+            self.snap_h = self.snap_v = None
+            self.flip_x = False
+            return
             self.snap_h = self.snap_v = None
             self.flip_x = False
             return
@@ -6805,6 +6902,14 @@ class PetWindow(QWidget):
 
         2026-10-25：窗口宽度固定成最宽画布之后，窗口比窄动作宽出一截，
         贴边吸附要是还按窗口宽度算，鱼就会离屏幕边 170 多像素。
+
+        2026-10-27（主人转述的真机反馈：「三维状态下拖拽到边缘吸附后还是不够靠边」）：
+        三视图 / 挂件是**同一个毛病**，只是幅度小 —— `_calc_window_size()` 给窗口
+        左右各留了一圈 `win_mx`（`body * 0.062 + 6`，238 档实测 21px、340 档 27px），
+        鱼是**居中**画在窗口里的。这里原来直接返回窗口宽度，于是贴边贴的是**窗口**的边，
+        吸附完鱼离屏幕边还差那 21~27px。现在返回"这一档最宽的那张精灵"的宽度。
+        ⚠️ 取 `max` 而不是当前这张：跟着当前帧算的话，一转身侧面窄了、吸附距离就跟着跳
+        （灵动版那条注释里踩过同样的坑）。
         """
         if self.skin == SKIN_ANIM:
             try:
@@ -6812,11 +6917,79 @@ class PetWindow(QWidget):
                 return float(mw) * self._body_h() / max(1, mh)
             except Exception:
                 pass
-        return float(self.width())
+            return float(self.width())
+        try:
+            # ⚠️ 只算**当前形象**的那几张：`self.sprites` 里同一个高度还躺着挂件那张
+            # （172 宽，比三视图的正面 137 宽得多），一起取 max 会把留白算大 ——
+            # 0.54 档实测窗口 207、鱼只有 137，缝就从 17 变成 35。
+            names = {"挂件"} if self.skin == SKIN_WIDGET else {"正面", "侧面", "背面"}
+            return float(max(p.width() for k, p in self.sprites.items()
+                             if k[1] == int(self.cur_h) and k[0] in names))
+        except (ValueError, TypeError):
+            return float(self.width())
 
     def _content_margin(self):
         """窗口左右两侧的透明留白（鱼居中，所以两边一样）。"""
         return max(0.0, (self.width() - self._content_w()) / 2.0)
+
+    def _content_bottom(self):
+        """鱼脚底到窗口下沿的留白。
+
+        两条绘制分支（三视图 `draw_one` / 灵动版）都把脚底钉在
+        `height - MARGIN - 10` 那条线上，所以这里是个常数。
+        吸附到底边时要把它减掉，否则鱼脚离屏幕下沿还差 14px。
+        """
+        return float(MARGIN + 10)
+
+    def _bubble_offsets(self):
+        """窗口左右各探出屏幕多少像素 (off_l, off_r)。
+
+        按窗口几何缓存：paintEvent 是 50 帧/秒的热路径，而 `screen()` /
+        `availableGeometry()` 都是 Win32 调用 —— 位置没变就别每帧问一次。
+        """
+        key = (self.x(), self.y(), self.width(), self.height())
+        cache = getattr(self, "_bub_off_cache", None)
+        if cache is not None and cache[0] == key:
+            return cache[1]
+        off_l = off_r = 0.0
+        try:
+            geo = (self.screen() or QApplication.primaryScreen()).availableGeometry()
+            off_l = max(0.0, geo.left() - self.x())
+            off_r = max(0.0, (self.x() + self.width()) - (geo.right() + 1))
+        except Exception:
+            pass
+        self._bub_off_cache = (key, (off_l, off_r))
+        return off_l, off_r
+
+    def _bubble_x(self, bw):
+        """气泡左边在窗口坐标里的位置：平时居中，但**不许超出屏幕**。
+
+        贴边吸附之后窗口会探出屏幕 `_content_margin()`（鱼才贴得住边），
+        气泡要是还按窗口居中画，靠边那一侧就被屏幕切掉了 ——
+        主人 2026-10-27 报的「贴边吸附太近了，气泡框显示不全了」就是它。
+        这里把气泡整体往里挪一点，鱼照样贴着边，气泡完整。
+        """
+        bx = (self.width() - bw) / 2.0
+        off_l, off_r = self._bubble_offsets()
+        lo = off_l + 2.0
+        hi = self.width() - off_r - 2.0 - bw
+        if hi >= lo:
+            bx = min(max(bx, lo), hi)
+        else:
+            bx = lo            # 实在装不下：至少让开口那侧完整露出来
+        return bx
+
+    def _bubble_max_w(self):
+        """气泡最宽能有多少：平时 240 / 窗口宽-16，贴边探出屏幕时再收窄。
+
+        不收窄的话，窗口探出 40 多像素时气泡比"露在屏幕里的那截"还宽，
+        怎么挪都会被切掉一截（2026-10-27 实测：窗口 207 探出 43，气泡 199）。
+        收窄之后文字会多折一行，整块气泡就都在屏幕里了。
+        """
+        off_l, off_r = self._bubble_offsets()
+        w = min(float(self.width() - 16),
+                self.width() - 16 - off_l - off_r)
+        return max(96.0, min(240.0, w))
 
     def _canvas_to_content_w(self, canvas):
         """把某段动作的画布尺寸换算成"鱼在那段里画出来有多宽"。
@@ -6834,9 +7007,14 @@ class PetWindow(QWidget):
     def _settle(self, geo=None):
         if not self.snap_on or (self.snap_h is None and self.snap_v is None):
             return
-        # 跟随鼠标时不做吸附（2026-10-25 多屏）：它得跟着光标走，
-        # 一吸就被拽回屏幕边 —— 光标到了副屏，它会被一直吸在原屏的边上过不去。
-        if self.mode == "follow":
+        # 只有「原地待着」能吸附（主人 2026-10-27：「在选择跟随鼠标和自由行动的模式时，
+        # 不允许打开吸附，不然问题有点多」）：
+        #   - 跟随：它得跟着光标走，一吸就被拽回屏幕边，光标到了副屏都过不去；
+        #   - 自由散步：落脚点是自己挑的，一吸就跟散步的目标点打架（原地蹭/来回抽）。
+        # 状态一起清掉，免得切回「原地待着」时用一个过期的吸附轴把它拽走。
+        if self.mode != "still":
+            self.snap_h = self.snap_v = None
+            self.flip_x = False
             return
         # 正甩出去滑行呢：位置归惯性管，这时候吸附就是"滑到一半被拽到边上"。
         # 滑完 `_finish_fling()` 会自己调 `_snap_to_edge()`（issue #2：滑完再吸附）。
@@ -6845,14 +7023,17 @@ class PetWindow(QWidget):
         geo = geo or (self.screen() or QApplication.primaryScreen()).availableGeometry()
         x, y = self.x(), self.y()
         m = self._content_margin()      # 贴边贴的是"鱼"的边，不是窗口的边
+        bot = self._content_bottom()    # 脚底到窗口下沿那 14px 也要减掉
         if self.snap_h == "left":
             x = geo.left() - m
         elif self.snap_h == "right":
             x = geo.right() - self.width() + 1 + m
         if self.snap_v == "top":
+            # 顶边**不**减气泡区：窗口上方那块是气泡的位置，鱼要是顶到屏幕最上面，
+            # 一说话气泡就跑到屏幕外了。这条保持原样（2026-10-27 复核过）。
             y = geo.top()
         elif self.snap_v == "bottom":
-            y = geo.bottom() - self.height() + 1
+            y = geo.bottom() - self.height() + 1 + bot
         # 吸附轴已经是精确贴边，只有没吸附的轴才需要钳制在屏幕内
         if self.snap_h is None:
             x = max(geo.left() - m, min(geo.right() - self.width() + 1 + m, x))
@@ -6886,12 +7067,14 @@ class PetWindow(QWidget):
                 bfont = QFont(self.bubble_font)
                 bg, fg = ink["bg"], ink["fg"]
             fm = QFontMetrics(bfont)
-            max_w = min(240, self.width() - 16)
+            max_w = self._bubble_max_w()
             words = self.bubble_text
             lines = []
             cur = ""
             for ch in words:
-                if fm.horizontalAdvance(cur + ch) > max_w - 20:
+                # 折行留 28 的余量：气泡本身左右各 14 的内边距，
+                # 这样算出来的 bw 正好不超过 max_w（以前留 20，气泡会宽出 8px）
+                if fm.horizontalAdvance(cur + ch) > max_w - 28:
                     lines.append(cur)
                     cur = ch
                 else:
@@ -6899,12 +7082,13 @@ class PetWindow(QWidget):
             lines.append(cur)
             bw = max(fm.horizontalAdvance(l) for l in lines) + 28
             bh = len(lines) * fm.height() + 16
-            bx = (self.width() - bw) / 2
+            bx = self._bubble_x(bw)
             by = self._bubble_top(bh)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(bg)
             p.drawRoundedRect(QRectF(bx, by, bw, bh), 14, 14)
-            tail = QPointF(self.width() / 2, by + bh)
+            # 尾巴跟着气泡走，但始终指着鱼（鱼在窗口正中）
+            tail = QPointF(min(max(self.width() / 2, bx + 14), bx + bw - 14), by + bh)
             p.drawPolygon(QPolygonF([tail, QPointF(tail.x() - 7, tail.y() + 9),
                                      QPointF(tail.x() + 7, tail.y() + 9)]))
             p.setPen(fg)
@@ -6942,12 +7126,12 @@ class PetWindow(QWidget):
             bh = fm_s.height() + fm_b.height() + fm_s.height() + 16
             if show_peak_line:
                 bh += fm_s.height()
-            bx = (self.width() - bw) / 2
+            bx = self._bubble_x(bw)
             by = self._bubble_top(bh)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(ink["bg"])
             p.drawRoundedRect(QRectF(bx, by, bw, bh), 14, 14)
-            tail = QPointF(self.width() / 2, by + bh)
+            tail = QPointF(min(max(self.width() / 2, bx + 14), bx + bw - 14), by + bh)
             p.drawPolygon(QPolygonF([tail, QPointF(tail.x() - 7, tail.y() + 9),
                                      QPointF(tail.x() + 7, tail.y() + 9)]))
             ty = by + 8
@@ -9367,6 +9551,28 @@ class PetWindow(QWidget):
             mins = int(self.cfg.get("quiet_minutes") or QUIET_DEFAULT_MIN)
             menu.addAction(f"免打扰 {mins} 分钟",
                            lambda: self.start_quiet())
+        # 工作与休息（issue #3）：**关着也留一条** —— 主人 2026-10-27 的原话是
+        # 「工作和休息这个在右键菜单里还是没有选项和图标」，说明"关着就不显示"
+        # 会让人以为这功能根本不存在。所以三种状态各有一条，永远看得见：
+        #   关着 → 「工作与休息提醒（未开启）…」（点了跳到设置那一页去开）
+        #   开着 → 「休息一下」
+        #   休息中 → 「结束休息（还剩 …）」
+        rest = (getattr(self, "ext", {}) or {}).get("rest")
+        if rest is not None:
+            try:
+                if rest.breaking():
+                    menu.addAction(
+                        f"结束休息（还剩 {fmt_duration(rest.break_left())}）",
+                        lambda _=False: rest.end_break())
+                elif rest.enabled:
+                    menu.addAction("休息一下",
+                                   lambda _=False: self.rest_start_break())
+                else:
+                    menu.addAction(
+                        "工作与休息提醒（未开启）…",
+                        defer_dialog(lambda: self.open_console("integration")))
+            except Exception as exc:
+                print("[rest] 菜单项没建出来:", exc)
         menu.addAction("今日汇总", self.show_daily_summary)
 
     def show_daily_summary(self):
@@ -9514,15 +9720,21 @@ class PetWindow(QWidget):
         baa.triggered.connect(self.set_balance_always)
 
         # 吸附：独立菜单，不再塞在「余额」下面
+        # 只有「原地待着」能用（主人 2026-10-27：跟随 / 自由散步时不许开吸附，
+        # 不然问题有点多）—— 其它模式下这两条直接置灰
         snap_menu = m.addMenu("吸附")
         sna = snap_menu.addAction("拖拽吸附四边")
         sna.setCheckable(True)
-        sna.setChecked(self.snap_on)
+        sna.setChecked(self.snap_on and self.mode == "still")
         sna.triggered.connect(self.set_snap)
         fka = snap_menu.addAction("左吸附时翻面")
         fka.setCheckable(True)
         fka.setChecked(self.flip_on_left)
         fka.triggered.connect(self.set_flip_on_left)
+        if self.mode != "still":
+            for a in (sna, fka):
+                a.setEnabled(False)
+                a.setText(a.text() + "（只在「原地待着」时可用）")
 
         # 文案：独立菜单（峰谷显示 + 三档文案）
         text_menu = m.addMenu("文案")
@@ -9703,11 +9915,14 @@ class PetWindow(QWidget):
         except Exception as exc:
             print("通知设置窗口刷新失败:", exc)
 
-    def open_console(self):
+    def open_console(self, page=None):
         """打开设置窗口（菜单最上面那条「打开设置…」）。
 
         窗口是懒加载的：建一次就留着，再点只是抬到前面。
+        `page` 可以指定停在哪一页（右键菜单那条「工作与休息提醒（未开启）…」用它）。
+        ⚠️ 菜单项触发时 Qt 会塞一个 `checked=False` 进来，所以这里只认字符串。
         """
+        page = page if isinstance(page, str) and page else None
         if ui_console is None:
             QMessageBox.warning(self, "设置", "界面模块没加载起来，看下启动时的报错。")
             return
@@ -9716,6 +9931,8 @@ class PetWindow(QWidget):
             try:
                 # 最小化着的话先播"还原动画"，别"啪"一下蹦出来
                 win.restore_or_show()
+                if page:
+                    win.switch_page(page)
                 return
             except RuntimeError:          # 窗口已经被 Qt 收掉了，重建一个
                 self._console = None
@@ -9734,6 +9951,10 @@ class PetWindow(QWidget):
             "BUBBLE_STYLES": BUBBLE_STYLES,
             "LINE_FREQ_LEVELS": LINE_FREQ_LEVELS,
             "LINE_SECTIONS": LINE_SECTIONS,
+            # 「甩出手感」那张卡的滑块范围（和 fling_num() 夹的是同一份常量）
+            "FLING_RANGES": {"speed": FLING_SPEED_RANGE,
+                             "decay": (int(FLING_DECAY_RANGE[0]), int(FLING_DECAY_RANGE[1])),
+                             "bounce": (0, int(FLING_BOUNCE_RANGE[1] * 100))},
             # 「它会做什么」卡片要列这三个程序化小动作（名字 / 权重 / 衰减）
             "ACTIONS": dict(ACTIONS),
             "SKIN_PET": SKIN_PET,
@@ -9751,6 +9972,11 @@ class PetWindow(QWidget):
         self._console.show()
         self._console.raise_()
         self._console.activateWindow()
+        if page:
+            try:
+                self._console.switch_page(page)
+            except Exception as exc:
+                print("[console] 跳到指定页失败:", exc)
 
     def set_balance_source(self, name):
         """切换余额来源（DeepSeek / 用户自己加的其他服务）。"""
@@ -11098,6 +11324,16 @@ class PetWindow(QWidget):
         self.cfg["mode"] = mode
         if mode != "still":
             self._clear_still_side()     # 原地待着的"转头"状态带不走
+            # 吸附只在「原地待着」有意义（见 `_settle`）：切走就**关掉**，
+            # 免得散步/跟随时被一个过期的轴拽回屏幕边（主人 2026-10-27：
+            # 「两个模式下禁用吸附按钮改成关闭状态后不让开启」）。
+            self.snap_h = self.snap_v = None
+            self.flip_x = False
+            if getattr(self, "snap_on", False):
+                self.set_snap(False)
+        elif not getattr(self, "snap_on", True):
+            # 回到「原地待着」：吸附**自动打开**（主人要的：不然切回来发现吸附没了很怪）
+            self.set_snap(True)
         # 切模式：散步/跟随的走路动画要收干净（不然会侧着身子站在那儿）。
         # 这里不等 crab_out 播完 —— 用户切了模式就该立刻站正。
         if getattr(self, "_amb_phase", None) is not None:
@@ -12502,8 +12738,11 @@ class PetWindow(QWidget):
         """
         geo = self._move_geo()
         m = self._content_margin()
+        # 吸到底边时窗口本来就要往下探 `_content_bottom()`（鱼脚才贴得住边），
+        # 这里不一起放宽的话，每次夹屏都会先把它往上拽、`_settle()` 再拽回来。
+        bot = self._content_bottom() if self.snap_v == "bottom" else 0.0
         x = max(geo.left() - m, min(geo.right() - self.width() + m, self.x()))
-        y = max(geo.top(), min(geo.bottom() - self.height(), self.y()))
+        y = max(geo.top(), min(geo.bottom() - self.height() + bot, self.y()))
         if (x, y) != (self.x(), self.y()):
             self.move(x, y)
         self._settle(geo)
