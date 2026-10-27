@@ -1117,6 +1117,17 @@ class NavItem(QAbstractButton):
             QRectF(39, 0, self.width() - 48, float(self.height())),
             int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
             self.text())
+        # 右边六个小点 = "这条可以拖"的抓手（主人 2026-10-27 要的）
+        if self.draggable:
+            dot = QColor(fg)
+            dot.setAlpha(120 if self._hover else 62)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(dot)
+            dx = self.width() - 17
+            dy = (self.height() - 14) // 2
+            for row in range(3):
+                for col in range(2):
+                    painter.drawEllipse(QRectF(dx + col * 5.0, dy + row * 5.0, 2.0, 2.0))
         painter.end()
 
 
@@ -1880,6 +1891,15 @@ class ConsoleWindow(QWidget):
             pass
         self._relayout_nav()
 
+    def _reset_nav_order(self):
+        """把左侧分类恢复成出厂顺序（把存的那份删掉就行）。"""
+        self.pet.cfg.pop("console_page_order", None)
+        try:
+            self.pet.save_config()
+        except Exception:
+            pass
+        self._relayout_nav()
+
     def _build_sidebar(self):
         side = QFrame()
         side.setObjectName("sidebar")
@@ -1931,6 +1951,13 @@ class ConsoleWindow(QWidget):
             self._nav_items[key] = item
             nav.addWidget(item)
         nav.addStretch(1)
+        # 「恢复默认顺序」：拖乱了能一键还原（主人 2026-10-27 要的）
+        self.nav_reset = QPushButton("恢复默认顺序")
+        self.nav_reset.setFixedHeight(26)
+        self.nav_reset.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.nav_reset.setToolTip("把左边这些分类恢复成出厂顺序")
+        self.nav_reset.clicked.connect(lambda _=False: self._reset_nav_order())
+        nav.addWidget(self.nav_reset)
         box.addWidget(self.nav_box, 1)
 
         # 搜索结果那一块（平时藏着）

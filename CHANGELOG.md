@@ -1,6 +1,45 @@
 # 更新日志
 
+## 未发布（2026-10-27 · 第四十九轮：应用列表只留真应用 / 分类抓手）
+
+主人 2026-10-27：「7 改成在应用列表里就列出来真正的应用，什么 powershell 这种或者乱七八糟的
+启动器就不要放进去了，参考 ios 的应用识别」「6 加小点阵和恢复默认」。
+
+### 1. ⭐ 顺带挖出个大 bug：中文系统上开始菜单那批应用**全丢了**
+
+`scan_apps()` 里那条脚本的输出在中文 Windows 上是 **GBK**，而 `subprocess.run(text=True)`
+按 **UTF-8** 解 → `UnicodeDecodeError` 抛在**读取线程**里，主流程的 `except` 一吞，
+**整批开始菜单应用（Steam / 微信 / 剪映…）一个都进不来**，列表里只剩正在跑的进程。
+
+修：脚本开头钉 `[Console]::OutputEncoding=[Text.Encoding]::UTF8`，
+调用处加 `encoding="utf-8", errors="replace"`。修完扫到 **43 个**（之前只有 9 个、还全是杂项）。
+
+### 2. 只列"真正的应用"（参考 iOS）
+
+- **只收有可见窗口、且不是工具窗口（WS_EX_TOOLWINDOW）的进程** —— 后台服务、驱动小助手、
+  解释器自然挡在外面；
+- 系统 / 命令行黑名单：命令行宿主、shell、svchost/dllhost/mmc/msiexec、python/node/java/dotnet…；
+- 按名字挡：`unins* / setup* / update* / helper* / crash* / service* / vc_redist…`，
+  标题里带「卸载 / 帮助 / 官网 / 手册 / 许可」的也挡；
+- 路径挡：`C:\Windows\**`、`\WindowsApps\`、`\Temp\`；
+- **同目录"启动器 + 本体"都有时只留本体**（`overwatch launcher.exe` 会被 `overwatch.exe` 顶掉）；
+  只剩启动器的，名字后面标「（启动器）」。
+- 名字优先用开始菜单的（「Microsoft Edge」而不是「msedge」）。
+
+实测这份机器：43 个，全是可以双击打开的应用（Steam / WeGame / 微信 / 抖音 / 剪映 / 守望先锋（启动器）…）。
+
+### 3. 分类拖拽的抓手 + 恢复默认
+
+- 每条分类右边画**六个小点**（悬停变亮），一眼能看出"这条能拖"；
+- 侧栏底部加「**恢复默认顺序**」按钮（清掉 `console_page_order` 再重排）。
+
+### 验证
+
+- `test_console_nav_order` 加第 6 节（恢复默认 + 配置清空）
+- `手动测试.bat` → 6：18 个脚本全绿
+
 ## 未发布（2026-10-27 · 第四十八轮：加了应用却看不见）
+
 
 主人 2026-10-27：「我加了守望先锋也没显示啊」。
 

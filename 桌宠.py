@@ -2819,18 +2819,146 @@ def extract_usage(obj, depth=0):
     return None
 
 
+# 扫描应用时要挡掉的东西 —— 主人 2026-10-27：「什么 powershell 这种或者乱七八糟的启动器
+# 就不要放进去了，参考 iOS 的应用识别」。iOS 的列表里只有"能双击打开的那个 App"，
+# 没有解释器、没有后台服务、没有卸载器。
+_APP_BLOCK_EXE = {
+    # 命令行 / 脚本宿主
+    "powershell.exe", "pwsh.exe", "cmd.exe", "conhost.exe", "wscript.exe", "cscript.exe",
+    "mshta.exe", "rundll32.exe", "regsvr32.exe", "wt.exe", "windowsterminal.exe",
+    # 系统组件 / 外壳
+    "svchost.exe", "dllhost.exe", "mmc.exe", "msiexec.exe", "regedit.exe", "taskmgr.exe",
+    "explorer.exe", "werfault.exe", "taskhostw.exe", "sihost.exe", "ctfmon.exe", "dwm.exe",
+    "runtimebroker.exe", "searchapp.exe", "shellexperiencehost.exe", "textinputhost.exe",
+    "startmenuexperiencehost.exe", "applicationframehost.exe", "lockapp.exe",
+    "backgroundtaskhost.exe", "useroobebroker.exe", "systemsettings.exe",
+    "securityhealthsystray.exe",
+    # 解释器 / 运行时
+    "python.exe", "pythonw.exe", "node.exe", "java.exe", "javaw.exe", "dotnet.exe",
+    "crashpad_handler.exe", "git.exe", "bash.exe", "ssh.exe",
+}
+# 名字像这些的也不收：卸载器 / 安装器 / 更新器 / 崩溃上报 / 各种 helper
+_APP_BLOCK_EXE_RE = re.compile(
+    r"^(unins|uninstall|setup|install|update|updater|patch|helper|crash|report|feedback|"
+    r"service|daemon|agent|broker|launcher_|vc_?redist|dxsetup|dotnetfx|easyanticheat|"
+    r"battleye|steamservice|epicwebhelper)", re.I)
+# 标题里带这些词的也不收（开始菜单里那些"卸载 / 帮助 / 官网 / 手册"）
+_APP_BLOCK_LABEL_RE = re.compile(
+    r"(卸载|uninstall|帮助|help|readme|说明|手册|文档|许可|license|更新|update|"
+    r"修复|repair|网站|website|官网|manual|homepage|support|疑难|诊断)", re.I)
+
+
+def _window_pids():
+    """有"可见且带标题"的顶层窗口的进程 id —— 判断这是不是一个真在用的应用。"""
+    out = set()
+    try:
+        from ctypes import wintypes
+        user32 = ctypes.WinDLL("user32.dll")
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        def _cb(hwnd, _lparam):
+            try:
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                if user32.GetWindowTextLengthW(hwnd) <= 0:
+                    return True
+                # 工具窗口（WS_EX_TOOLWINDOW）基本是驱动 / 托盘小助手，不算"应用"
+                GWL_EXSTYLE = -20
+                WS_EX_TOOLWINDOW = 0x00000080
+                if user32.GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW:
+                    return True
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value:
+                    out.add(int(pid.value))
+            except Exception:
+                pass
+            return True
+
+        user32.EnumWindows(_cb, 0)
+    except Exception:
+        pass
+    return out
+
+
+def _looks_like_real_app(exe, label, path):
+    """这条到底该不该出现在应用列表里。"""
+    exe = (exe or "").lower()
+    if not exe.endswith(".exe") or exe in _APP_BLOCK_EXE:
+        return False
+    if _APP_BLOCK_EXE_RE.match(exe):
+        return False
+    if label and _APP_BLOCK_LABEL_RE.search(label):
+        return False
+    p = (path or "").lower().replace("/", "\\")
+    if p:
+        root = (os.environ.get("SystemRoot") or "C:\\Windows").lower()
+        if p.startswith(root + "\\"):
+            return False                     # System32 / SysWOW64 / WinSxS 全在这底下
+        if "\\windowsapps\\" in p:            # 商店应用的执行别名，加了也白加
+            return False
+        if "\\temp\\" in p or "\\tmp\\" in p:
+            return False
+    return True
+
+
+def _drop_launcher_dupes(apps):
+    """同一文件夹里既有「X launcher.exe」又有「X.exe」时，只留后者。
+
+    iOS 里一个 App 就一行；Windows 上常常"启动器 + 本体"两个 exe，
+    都列出来主人会不知道选哪个（他加的就是 `overwatch launcher.exe`）。
+    """
+    by_dir = {}
+    for exe, info in apps.items():
+        path = info[1]
+        if path:
+            by_dir.setdefault(os.path.dirname(path).lower(), set()).add(exe)
+    drop = set()
+    for _d, exes in by_dir.items():
+        for exe in exes:
+            stem = exe[:-4] if exe.endswith(".exe") else exe
+            for suf in (" launcher", "launcher", " start", " starter", " _launcher"):
+                if stem.endswith(suf):
+                    base = stem[: -len(suf)].strip()
+                    if base and (base + ".exe") in exes:
+                        drop.add(exe)
+                        break
+    return drop
+
+
 def scan_apps():
-    """扫描本机应用：正在运行的进程 + 开始菜单里的快捷方式。
+    """扫描本机应用：开始菜单快捷方式 + **有窗口的**正在运行的进程。
 
     返回 [(exe 名小写, 展示名, exe 完整路径)]，按展示名排序。
     路径是给对话框取图标用的（拿不到就是空串）。
+
+    ⚠️ 2026-10-27 大改：原来把所有进程都塞进来，列表里全是命令行 / 运行时 / 各种 helper，
+    主人说"参考 iOS 的应用识别"。现在：
+      - 只收"有可见窗口"的进程（后台服务、解释器自然挡在外面）；
+      - 系统 / 命令行黑名单；
+      - 卸载器 / 安装器 / 更新器 / 说明文档按名字挡掉；
+      - 同目录"启动器 + 本体"都有时只留本体。
     """
     apps = {}
-    for name, path in running_processes():
-        if name.endswith(".exe"):
-            apps.setdefault(name, (name, path))
+    try:
+        pids = _window_pids()
+    except Exception:
+        pids = set()
+    try:
+        for exe, path, pid in running_processes(with_pid=True):
+            if pids and pid not in pids:
+                continue                     # 没窗口 → 后台进程，不算"应用"
+            label = APP_LABELS.get(exe) or (exe[:-4] if exe.endswith(".exe") else exe)
+            if _looks_like_real_app(exe, label, path):
+                apps.setdefault(exe, (label, path))
+    except Exception:
+        pass
     # 开始菜单的快捷方式（含用户目录），交给 PowerShell 解析目标 exe
     script = (
+        # ⚠️ 先钉死输出编码：中文系统上默认是 GBK，而 subprocess 按 UTF-8 解
+        # → 抛 UnicodeDecodeError（在读取线程里），**整批开始菜单应用全丢**
+        # （主人 2026-10-27 之前的列表里连 Steam 都没有，就是这个原因）。
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
         "$ErrorActionPreference='SilentlyContinue';"
         "$sh=New-Object -ComObject WScript.Shell;"
         "$dirs=@(\"$env:ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\","
@@ -2842,6 +2970,7 @@ def scan_apps():
     try:
         out = subprocess.run(["powershell", "-NoProfile", "-Command", script],
                              capture_output=True, text=True, timeout=25,
+                             encoding="utf-8", errors="replace",
                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         for line in (out.stdout or "").splitlines():
             if "|" not in line:
@@ -2849,10 +2978,24 @@ def scan_apps():
             target, label = line.split("|", 1)
             target = target.strip()
             exe = os.path.basename(target).lower()
-            if exe.endswith(".exe"):
-                apps.setdefault(exe, (label.strip() or exe, target))
+            label = label.strip()
+            if not _looks_like_real_app(exe, label, target):
+                continue
+            # 快捷方式名一般比 exe 名好看（「Microsoft Edge」vs「msedge」）——
+            # 进程那条先到的话名字是裸 exe 名，这里要**换成**开始菜单的名字。
+            old = apps.get(exe)
+            if old is None:
+                apps[exe] = (label or exe, target)
+            elif label and (old[0].lower() in (exe, exe[:-4]) or len(label) > len(old[0])):
+                apps[exe] = (label, old[1] or target)
     except Exception:
         pass
+    for exe in _drop_launcher_dupes(apps):
+        apps.pop(exe, None)
+    # 剩下的启动器标一下，免得主人以为选错了
+    for exe, (label, path) in list(apps.items()):
+        if "launcher" in exe and "启动器" not in label:
+            apps[exe] = (f"{label}（启动器）", path)
     return sorted(((exe, info[0], info[1]) for exe, info in apps.items()),
                   key=lambda item: item[1].lower())
 
@@ -2886,8 +3029,11 @@ def foreground_process_name():
     return ""
 
 
-def running_processes():
-    """枚举当前进程，返回 [(exe 小写名, 完整路径)]。用 Windows API，不依赖 psutil。"""
+def running_processes(with_pid=False):
+    """枚举当前进程，返回 [(exe 小写名, 完整路径)]。用 Windows API，不依赖 psutil。
+
+    `with_pid=True` 时返回三元组（多一个 pid）—— 扫描应用列表要用它过滤"没有窗口的后台进程"。
+    """
     out = []
     try:
         from ctypes import wintypes
@@ -2913,7 +3059,7 @@ def running_processes():
                     path = buf.value
                     exe = path.rsplit("\\", 1)[-1].lower()
                     if exe:
-                        out.append((exe, path))
+                        out.append((exe, path, int(pid)) if with_pid else (exe, path))
             finally:
                 kernel32.CloseHandle(handle)
     except Exception:
