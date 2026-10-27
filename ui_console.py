@@ -21,10 +21,10 @@ import time
 from string import Template
 
 from PySide6.QtCore import (QAbstractNativeEventFilter, QEasingCurve, QEvent,
-                            QByteArray, QObject, QParallelAnimationGroup, QPoint,
+                            QByteArray, QMimeData, QObject, QParallelAnimationGroup, QPoint,
                             QPropertyAnimation, QRect, QRectF, QSize, Qt, QTimer,
                             QUrl, QVariantAnimation)
-from PySide6.QtGui import (QColor, QCursor, QFont, QIcon, QImage, QPainter,
+from PySide6.QtGui import (QColor, QCursor, QDrag, QFont, QIcon, QImage, QPainter,
                            QPainterPath, QPen, QPixmap, QRegion, QWheelEvent)
 from PySide6.QtWidgets import (QAbstractButton, QAbstractScrollArea,
                                QAbstractSlider, QApplication, QButtonGroup,
@@ -1003,8 +1003,49 @@ class AlignGrid(QWidget):
             btn.setChecked(True)
 
 
+NAV_MIME = "application/x-dfy-nav"       # 左侧分类拖拽用的私有格式
+
+
+class NavBox(QWidget):
+    """左侧那列分类的容器：接收拖放，用来**调顺序**。
+
+    主人 2026-10-27：「让设置界面的大选项（除了关于）可以让用户任意调整上下位置」。
+    分类条自己发 QDrag（见 `NavItem.mouseMoveEvent`），这里接住、算出插到谁前面/后面，
+    然后交给窗口去重排 + 存配置（`console_page_order`）。
+    """
+
+    def __init__(self, win, parent=None):
+        super().__init__(parent)
+        self.win = win
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, ev):
+        if ev.mimeData().hasFormat(NAV_MIME):
+            ev.acceptProposedAction()
+        else:
+            ev.ignore()
+
+    def dragMoveEvent(self, ev):
+        if ev.mimeData().hasFormat(NAV_MIME):
+            ev.acceptProposedAction()
+
+    def dropEvent(self, ev):
+        if not ev.mimeData().hasFormat(NAV_MIME):
+            ev.ignore()
+            return
+        try:
+            key = bytes(ev.mimeData().data(NAV_MIME)).decode("utf-8", "replace")
+        except Exception:
+            return
+        self.win.drop_nav_item(key, ev.position().toPoint())
+        ev.acceptProposedAction()
+
+
 class NavItem(QAbstractButton):
-    """左侧一条分类：图标 + 文字，选中时铺一层主题色底片。"""
+    """左侧一条分类：图标 + 文字，选中时铺一层主题色底片。
+
+    可以按住往上/下拖来调顺序（「关于」除外，它永远钉在最后）。
+    """
 
     def __init__(self, key, text, icon_name, parent=None):
         super().__init__(parent)
@@ -1016,6 +1057,31 @@ class NavItem(QAbstractButton):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._hover = False
+        self._press_pos = None
+        self.draggable = key != "about"
+        if self.draggable:
+            self.setToolTip("按住往上/下拖，可以调整这一项的位置")
+
+    # ---- 拖拽排序
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton and self.draggable:
+            self._press_pos = ev.position().toPoint()
+        super().mousePressEvent(ev)
+
+    def mouseMoveEvent(self, ev):
+        if self._press_pos is None or not self.draggable:
+            return super().mouseMoveEvent(ev)
+        if (ev.position().toPoint() - self._press_pos).manhattanLength() < 8:
+            return super().mouseMoveEvent(ev)
+        self._press_pos = None           # 只发一次
+        drag = QDrag(self)
+        mime = QMimeData()
+        mime.setData(NAV_MIME, self.key.encode("utf-8"))
+        drag.setMimeData(mime)
+        shot = self.grab()
+        drag.setPixmap(shot)
+        drag.setHotSpot(QPoint(shot.width() // 2, shot.height() // 2))
+        drag.exec(Qt.DropAction.MoveAction)
 
     def enterEvent(self, _ev):
         self._hover = True
@@ -1769,6 +1835,51 @@ class ConsoleWindow(QWidget):
         self._live.start()
 
     # ---------------- 骨架 ----------------
+    # ---------------- 左侧分类的顺序（可以拖）
+    def _nav_order(self):
+        """当前分类顺序：配置里存的优先，缺的按 PAGES 原顺序补，「关于」永远最后。"""
+        saved = self.pet.cfg.get("console_page_order") or []
+        order = [k for k in saved if k in {k for k, *_ in self.PAGES}]
+        for k, *_ in self.PAGES:
+            if k not in order:
+                order.append(k)
+        return [k for k in order if k != "about"] + ["about"]
+
+    def _relayout_nav(self):
+        """按 `_nav_order()` 把分类条重新插一遍（条目对象复用，不重建）。"""
+        nav = self.nav_box.layout()
+        if nav is None:
+            return
+        for item in self._nav_items.values():
+            nav.removeWidget(item)
+        for i, key in enumerate(self._nav_order()):
+            item = self._nav_items.get(key)
+            if item is not None:
+                nav.insertWidget(i, item)
+
+    def drop_nav_item(self, key, pos):
+        """把 `key` 这条拖到 `pos` 那个位置（上下半区决定插前面还是后面）。"""
+        if key == "about" or key not in self._nav_items:
+            return
+        w = self.nav_box.childAt(pos)
+        while w is not None and not isinstance(w, NavItem):
+            w = w.parentWidget()
+        target, after = None, False
+        if isinstance(w, NavItem) and w.key not in (key, "about"):
+            target = w.key
+            top = w.mapTo(self.nav_box, QPoint(0, 0)).y()
+            after = pos.y() > top + w.height() // 2
+        rest = [k for k in self._nav_order() if k not in (key, "about")]
+        idx = len(rest) if target is None else rest.index(target) + (1 if after else 0)
+        idx = max(0, min(len(rest), idx))
+        rest.insert(idx, key)
+        self.pet.cfg["console_page_order"] = rest + ["about"]
+        try:
+            self.pet.save_config()
+        except Exception:
+            pass
+        self._relayout_nav()
+
     def _build_sidebar(self):
         side = QFrame()
         side.setObjectName("sidebar")
@@ -1808,11 +1919,13 @@ class ConsoleWindow(QWidget):
         box.addWidget(self.search_edit)
 
         # 分类那一块（搜索时整块藏起来）
-        self.nav_box = QWidget()
+        self.nav_box = NavBox(self)
         nav = QVBoxLayout(self.nav_box)
         nav.setContentsMargins(0, 2, 0, 0)
         nav.setSpacing(4)
-        for key, title, _desc, icon_name, _builder in self.PAGES:
+        by_key = {k: (t, i) for k, t, _d, i, _b in self.PAGES}
+        for key in self._nav_order():
+            title, icon_name = by_key[key]
             item = NavItem(key, title, icon_name)
             item.clicked.connect(lambda _=False, k=key: self.switch_page(k))
             self._nav_items[key] = item
@@ -3431,6 +3544,14 @@ class ConsoleWindow(QWidget):
             [(name, name) for name in pet.task_sound_names()],
             pet.cfg.get("task_sound_set", "叮"),
             lambda name: self._run(pet.set_task_sound_set, name))
+        # 提示音自己的音量（老版本没有这个键，读不到就按 80% 显示）
+        try:
+            _tv = pet.task_sound_volume()
+        except Exception:
+            _tv = 0.8
+        page.slider(card2, "提示音音量", "只管这一声，不影响点击音效", 0, 100,
+                    int(round(float(_tv) * 100)), "%",
+                    lambda v: self._run(pet.set_task_sound_volume, v / 100.0))
         page.buttons(card2, [
             ("试听", lambda: pet.preview_task_sound(), "primary", "page.volume-high"),
             ("换成我的音频…", self._add_task_sound, None, "ui.add"),
@@ -3479,11 +3600,12 @@ class ConsoleWindow(QWidget):
              lambda: self._run(pet.remove_custom_app_dialog), "danger", "ui.delete"),
         ])
         page.hint(card, "每个应用可单独设置提示文字；未添加的应用不受影响。")
-        # 一条都没配过时给张插图 + 一句"下一步做什么"，别只留一片空白
-        self.integration_empty = page.empty(
-            "empty.app", "尚未配置应用提示",
-            "点「扫描本机应用并添加…」选择一个应用", size=44, layout=card)
-        self._hook_page("integration", self._sync_integration_empty)
+        # 这里原来挂的是一张「尚未配置应用提示」的空状态插图 —— 但**内置那 18 个应用
+        # 是默认就在盯的**（PROCESS_LINES），只有"自己加的 / 改过台词的"才算 custom。
+        # 主人 2026-10-27：「明明有默认的应用和我自己选择的应用，却一直显示未配置」，
+        # 就是被那张插图误导的。改成一行**说清现在盯着哪些**的小字。
+        self.integration_hint = page.hint(card, self._integration_text(), "muted")
+        self._hook_page("integration", self._sync_integration_hint)
 
         card = page.card("使用时长提醒", "连续使用同一应用达到设定时长后提醒",
                          "ui.timer")
@@ -3579,14 +3701,32 @@ class ConsoleWindow(QWidget):
             if label is not None:
                 label.setText(fn())
 
-    def _sync_integration_empty(self):
-        """一个自定义 / 改写的应用都没有时，把那块空状态露出来。"""
+    def _integration_text(self):
+        """「应用启动提醒」现在到底在盯哪些应用（内置 18 个默认就在盯）。"""
         pet = self.pet
+        try:
+            merged = pet._process_lines_map() or {}
+        except Exception:
+            merged = {}
         custom = pet.cfg.get("custom_process_lines") or {}
         overrides = pet.cfg.get("default_line_overrides") or {}
-        empty = getattr(self, "integration_empty", None)
-        if empty is not None:
-            empty.setVisible(not (custom or overrides))
+        if not merged:
+            return "现在没有可提示的应用。点「扫描本机应用并添加…」加一个。"
+        try:
+            names = [pet.app_label(e) for e in list(merged)[:5]]
+        except Exception:
+            names = [str(e) for e in list(merged)[:5]]
+        n = len(merged)
+        tail = f" 等 {n} 个" if n > 5 else f"（共 {n} 个）"
+        extra = ""
+        if custom or overrides:
+            extra = f"；其中 {len(custom)} 个是你自己加的、{len(overrides)} 个改过台词"
+        return f"现在盯着：{'、'.join(names)}{tail}{extra}。内置应用默认就有提示，不用另配。"
+
+    def _sync_integration_hint(self):
+        hint = getattr(self, "integration_hint", None)
+        if hint is not None:
+            hint.setText(self._integration_text())
 
     # ---------------- 性能与工具 ----------------
     def _page_performance(self, page):

@@ -470,6 +470,17 @@ class NotifyExtension:
         if not path or not os.path.exists(path):
             path = os.path.join(ASSET_DIR, "notify-chime.wav")
 
+        # ⚠️ 优先走桌宠那条**常开音频流**：能完整播完、音量也独立可调。
+        # 旧版一律用 QSoundEffect，而它"刚 setSource 还没解码完"时 play() 只响开头一小截
+        # —— 内置那声「叮」是立体声 wav，旧版 `load_clip` 又不认立体声，
+        # 于是每次都走 QSoundEffect，每次都断在开头（主人 2026-10-27 报的
+        # 「任务提示音播放时不完整」）。立体声下混已经加上了。
+        try:
+            if self.pet.play_task_chime(path):
+                return
+        except Exception:
+            pass
+
         if self._chime is None or getattr(self, "_chime_path", "") != path:
             try:
                 from PySide6.QtCore import QUrl
@@ -479,7 +490,11 @@ class NotifyExtension:
                 eff.setSource(QUrl.fromLocalFile(path))
                 # 比点击音略小一档：是"提个醒"，不是"报喜"。自定义音频也一样缩，
                 # 不然主人挑的那段可能比点击音响一截。
-                eff.setVolume(min(1.0, 0.8 * float(getattr(self.pet, "volume", 0.9))))
+                try:
+                    _vol = self.pet.task_sound_volume()
+                except Exception:
+                    _vol = 0.8 * float(getattr(self.pet, "volume", 0.9))
+                eff.setVolume(_vol)
                 self._chime = eff
                 self._chime_path = path
             except Exception as exc:
@@ -487,7 +502,10 @@ class NotifyExtension:
                 return
         if self._chime is not None:
             try:
-                self._chime.play()
+                # 兜底也要等解码好：没 Ready 就排到 `_pending` 里（见 notify 的 tick）
+                from PySide6.QtMultimedia import QSoundEffect
+                if self._chime.status() == QSoundEffect.Status.Ready:
+                    self._chime.play()
             except Exception:
                 pass
 

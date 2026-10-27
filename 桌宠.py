@@ -1047,13 +1047,30 @@ class ClickPlayer(QIODevice):
 
     # --- 给桌宠用的接口 ---
     def load_clip(self, name, path):
+        """把一个 wav 读进内存（44100 / 16bit；立体声自动下混成单声道）。
+
+        ⚠️ 原来只认**单声道**，而内置的 `assets/notify-chime.wav` 是**立体声**的
+        —— 任务提示音走这条路时加载失败，退回 QSoundEffect，结果"响一半就断"
+        （主人 2026-10-27：「任务提示音播放时不完整」）。这里把左右声道平均一下，
+        立体声也能完整播完，主人自己加的音频也不用先转格式。
+        """
         try:
             with wave.open(path, "rb") as w:
-                if (w.getnchannels(), w.getsampwidth(), w.getframerate()) != (1, 2, self.rate):
+                ch, sw, rate = w.getnchannels(), w.getsampwidth(), w.getframerate()
+                if sw != 2 or rate != self.rate:
                     return False
                 data = w.readframes(w.getnframes())
             samples = array("h")
             samples.frombytes(data)
+            if ch == 2:
+                mono = array("h", bytes(len(samples)))     # 长度减半，先占位
+                n = len(samples) // 2
+                for i in range(n):
+                    v = (samples[2 * i] + samples[2 * i + 1]) // 2
+                    mono[i] = -32768 if v < -32768 else (32767 if v > 32767 else v)
+                samples = mono[:n]
+            elif ch != 1:
+                return False
             self._clips[name] = samples
             return True
         except Exception:
@@ -4156,6 +4173,9 @@ class PetWindow(QWidget):
             "sound_on": True,
             "sound_set": "小黄鸭",
             "volume": 0.9,
+            # 任务完成提示音自己的音量（0~1）。原来它跟全局音量绑在一起，
+            # 主人 2026-10-27 要单独一根滑块（"叮"太响 / 太轻都得能调）。
+            "task_sound_volume": 0.8,
             "show_peak": True,
             "peak_style": "默认",
             "bubble_style": "auto",     # 气泡风格：跟随界面 / 浅色 / 深色
@@ -5551,6 +5571,43 @@ class PetWindow(QWidget):
             ext._play_chime(force=True)
         except Exception as exc:
             print("[sound] 试听提示音失败:", exc)
+
+    def task_sound_volume(self):
+        """提示音自己的音量（0~1）。没配过就取 0.8（比点击音轻一点，是"提个醒"）。"""
+        try:
+            return max(0.0, min(1.0, float(self.cfg.get("task_sound_volume", 0.8))))
+        except (TypeError, ValueError):
+            return 0.8
+
+    def set_task_sound_volume(self, v):
+        try:
+            v = max(0.0, min(1.0, float(v)))
+        except (TypeError, ValueError):
+            return
+        self.cfg["task_sound_volume"] = round(v, 3)
+        self.save_config()
+
+    def play_task_chime(self, path=None):
+        """走**常开音频流**播提示音（能完整播完），返回是否成功。
+
+        ⚠️ 为什么不再用 QSoundEffect：内置那声「叮」是**立体声** wav，
+        旧版 `load_clip` 只认单声道 → 加载失败 → 退回 QSoundEffect，
+        而 QSoundEffect 在"刚 setSource 还没解码完"时 play() 只响开头一小截
+        （主人 2026-10-27：「任务提示音播放时不完整」）。
+        走这条常开流：设备一直是醒的，样本一次喂完，几秒长也不会被截。
+        """
+        player = getattr(self, "_click_player", None)
+        if player is None or not getattr(player, "ok", False):
+            return False
+        path = path or self.task_sound_path()
+        if not path or not os.path.exists(path):
+            return False
+        name = "任务提示音"
+        if getattr(self, "_task_chime_loaded", "") != path:
+            if not player.load_clip(name, path):
+                return False            # 采样率不是 44.1k 之类 → 让调用方退回 QSoundEffect
+            self._task_chime_loaded = path
+        return player.play(name, volume=self.task_sound_volume())
 
     def _register_task_sound(self, name, path):
         if not hasattr(self, "_custom_task_sounds"):
