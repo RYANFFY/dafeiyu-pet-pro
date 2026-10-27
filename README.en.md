@@ -14,12 +14,30 @@
 
 ### 👉 [**Download the latest Windows installer**](https://github.com/RYANFFY/deepseek-dafeiyu-pet/releases/latest/download/dafeiyu-pet-setup.exe)
 
-A ~73MB Chinese installer: double-click and click Next a few times — you can pick the install folder,
-shortcuts are created for you, and the installer itself can be deleted afterwards.
+A ~257MB Chinese installer (most of it is the 239MB animated sprite set): double-click and click
+Next a few times — you can pick the install folder, shortcuts are created for you, and the
+installer itself can be deleted afterwards.
 
 - Windows may warn about an unknown publisher (the exe is not code-signed): click "More info" → "Run anyway"
 - Packaged build keeps its settings in `%APPDATA%\大肥鱼桌宠\`
 - All versions and release notes: [Releases](https://github.com/RYANFFY/deepseek-dafeiyu-pet/releases)
+
+## 🆕 What's new in v1.1.7
+
+- **Throw it**: release while moving and it flies on with inertia, **bounces off the screen edge**,
+  and snaps to the edge once it settles; a slow release still snaps immediately. Three knobs under
+  Settings → 动作和互动 → 甩出手感 (throw speed / inertia decay / edge bounce), each with a range limit
+  and a "restore defaults" button
+- **Work / rest reminder** (sedentary + water): **off by default** — turn it on and it reminds you to
+  get up after 45 minutes of use and to drink water every 60 minutes. If keyboard and mouse are idle
+  for 3+ minutes it assumes you already took a break and restarts the count
+- **Snapping now really reaches the edge**: it used to stop 20–50 px short (it snapped the window,
+  not the fish). The speech bubble shifts inward so it never gets clipped by the screen
+- **Snapping only works in "stay in place" mode**: in follow / free-roam mode the switch turns itself
+  off and greys out, and switches back on when you return
+- **New right-click item「休息一下」**: becomes "end break (X min left)" while resting
+
+> Full details in the first two sections of [CHANGELOG](CHANGELOG.md).
 
 A transparent always-on-top desktop pet based on the DeepSeek fan-art character
 「鲸鱼娘 · 大肥鱼」, built with Python + PySide6. It walks around your desktop,
