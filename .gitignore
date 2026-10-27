@@ -16,6 +16,8 @@ menu-debug.log
 # 打包产物
 build/
 dist/
+# 打包日志（PyInstaller 等，2026-10-27 第 53 轮补：别再误提交）
+*.log
 
 # Python 缓存
 __pycache__/
