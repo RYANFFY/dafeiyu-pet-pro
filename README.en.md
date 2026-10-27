@@ -10,7 +10,7 @@
 
 ## ⬇️ Download (Windows)
 
-[![latest release](https://img.shields.io/github/v/release/RYANFFY/deepseek-dafeiyu-pet?label=latest)](https://github.com/RYANFFY/deepseek-dafeiyu-pet/releases/latest)
+[![latest release](https://img.shields.io/github/v/release/RYANFFY/deepseek-dafeiyu-pet?label=latest&v=3&cacheSeconds=300)](https://github.com/RYANFFY/deepseek-dafeiyu-pet/releases/latest)
 
 ### 👉 [**Download the latest Windows installer**](https://github.com/RYANFFY/deepseek-dafeiyu-pet/releases/latest/download/dafeiyu-pet-setup.exe)
 
