@@ -1891,6 +1891,21 @@ class ConsoleWindow(QWidget):
             pass
         self._relayout_nav()
 
+    def _copy_diag(self):
+        """复制一份**抹掉密钥**的诊断信息（可以直接贴到 issue / 群里）。"""
+        try:
+            text = self.pet.diag_text()
+        except Exception as exc:
+            text = f"生成诊断信息失败：{exc}"
+        try:
+            QApplication.clipboard().setText(text)
+        except Exception:
+            pass
+        try:
+            self.pet.say("诊断信息复制好了，密钥已抹掉", seconds=3.0, again=True)
+        except Exception:
+            pass
+
     def _reset_nav_order(self):
         """把左侧分类恢复成出厂顺序（把存的那份删掉就行）。"""
         self.pet.cfg.pop("console_page_order", None)
@@ -4300,7 +4315,9 @@ class ConsoleWindow(QWidget):
                         pet.set_classic_menu))
         page.buttons(card, [
             ("打开经典菜单…（旧版那份长菜单）",
-             lambda: self._run(pet._open_classic_menu), None, "ui.chevron")])
+             lambda: self._run(pet._open_classic_menu), None, "ui.chevron"),
+            ("复制诊断信息（不含密钥）", self._copy_diag, None, None),
+        ])
 
         card = page.card("最小化动画", "窗口最小化时往哪儿收", "ui.minimize")
         page.row(card, "落点",

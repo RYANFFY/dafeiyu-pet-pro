@@ -16,6 +16,7 @@ import math
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -204,6 +205,15 @@ else:
 SPRITE_DIR = os.path.join(BUNDLE_DIR, "sprites")
 ASSET_DIR = os.path.join(BUNDLE_DIR, "assets")     # 音效 + 小鲸鱼挂件形象
 CONFIG_PATH = os.path.join(USER_DIR, "config.json")
+# 上一份**写成功的**配置（保存时自动留一份）。config.json 万一被写坏，
+# `load_json` 会先试着从它恢复，而不是默默退回默认值把设置全丢掉。
+CONFIG_BAK = os.path.join(USER_DIR, "config.bak.json")
+
+
+def backup_path_of(path):
+    """某个 json 的备份路径：`config.json` → `config.bak.json`。"""
+    base, ext = os.path.splitext(path)
+    return base + ".bak" + (ext or "")
 
 # 新界面（设置窗口）：v1.1.0 起，菜单里的「打开设置…」开的是它。
 # 单独一个模块；万一它起不来，也绝不能拖垮桌宠本身 —— 老菜单照旧能用。
@@ -4181,6 +4191,15 @@ def calibrate_balance_usage(path, amount, why="手动校准"):
 
 
 def load_json(path, default):
+    """读 json；文件不在就按默认值建一个。
+
+    ⚠️ 2026-10-27（静态审查提的隐患，确实存在）：原来解析失败直接 `return default`
+    —— 配置文件要是被写坏了（断电 / 写到一半被杀 / 手改错），**用户所有设置会静默消失**，
+    而且坏文件被下一次保存直接覆盖，连救都救不回来。现在：
+      1. 把坏文件改名留证（`config.broken.json`），不覆盖它；
+      2. 试着从 `config.bak.json`（上一次写成功的）恢复；
+      3. 两个都不行才退回默认值。
+    """
     if not os.path.exists(path):
         with open(path, "w", encoding="utf-8") as f:
             json.dump(
@@ -4195,7 +4214,26 @@ def load_json(path, default):
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
 
-    except Exception:
+    except Exception as ex:
+        # 1) 坏文件留证：改个名，别让下一次保存把它盖掉
+        try:
+            broken = os.path.splitext(path)[0] + ".broken" + (os.path.splitext(path)[1] or ".json")
+            shutil.copy2(path, broken)
+            print(f"[config] {os.path.basename(path)} 读不出来（{ex!r}），"
+                  f"原文件留在 {os.path.basename(broken)}")
+        except Exception:
+            pass
+        # 2) 试试上一次写成功的备份
+        bak = backup_path_of(path)
+        if os.path.exists(bak):
+            try:
+                with open(bak, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                print(f"[config] 已从备份恢复：{os.path.basename(bak)}")
+                return data
+            except Exception:
+                pass
+        # 3) 实在没辙，退回默认
         return default
 
 
@@ -4281,13 +4319,85 @@ class PetWindow(QWidget):
 
     # ---------- 配置 ----------
     def save_config(self):
-        """把当前配置写回 config.json。"""
+        """把当前配置写回 config.json（**原子写** + 留一份上一版）。
+
+        ⚠️ 2026-10-27（静态审查提的）：原来是 `open(CONFIG_PATH, "w")` 直接覆盖 ——
+        写到一半断电 / 被杀 / 磁盘满，config.json 就成了**半截 JSON**，
+        下次启动解析失败，设置全丢。现在：
+          1. 先写 `config.json.tmp`（写完 fsync 落盘）；
+          2. 把现有的 config.json 复制成 `config.bak.json`（上一份有效配置）；
+          3. `os.replace(tmp, config.json)` —— Windows 上也是原子替换，
+             要么是旧文件、要么是新文件，不会出现半截。
+        """
+        tmp = CONFIG_PATH + ".tmp"
         try:
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(self.cfg, f, ensure_ascii=False, indent=2)
+            data = json.dumps(self.cfg, ensure_ascii=False, indent=2)
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(data)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+            try:
+                if os.path.exists(CONFIG_PATH):
+                    shutil.copy2(CONFIG_PATH, CONFIG_BAK)
+            except Exception:
+                pass
+            os.replace(tmp, CONFIG_PATH)
             self._cfg_snapshot = json.dumps(self.cfg, ensure_ascii=False, sort_keys=True)
         except Exception as ex:
             print("配置保存失败:", repr(ex))
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+
+    # 诊断信息里要抹掉的键（键名里带这些字样的一律不外发）
+    # ⚠️ 别只匹配 "key"：`hotkeys` / `hotkeys_on` 也含 key，会把快捷键配置当密钥抹掉
+    _SECRET_HINTS = ("api_key", "_key", "apikey", "token", "secret", "password",
+                     "passwd", "cookie")
+    _NOT_SECRET = ("hotkey", "hotkeys")
+
+    def diag_text(self):
+        """一份**可以放心贴给别人**的诊断信息（不含任何密钥）。
+
+        2026-10-27 静态审查第 5 条：API Key 明文存在 config.json 里，
+        分享配置 / 备份 / 排查日志时容易一起泄露。这里给一条安全出口：
+        版本、系统、关键开关、以及"哪些键被抹掉了"，密钥本身一个字符都不带。
+        """
+        safe, redacted = {}, []
+        for k, v in self.cfg.items():
+            kl = str(k).lower()
+            if any(t in kl for t in self._SECRET_HINTS) and not any(
+                    t in kl for t in self._NOT_SECRET):
+                redacted.append(k)
+                safe[k] = "***已抹掉***" if v else ""
+                continue
+            if k == "other_keys" and v:
+                redacted.append(k)
+                safe[k] = f"***{len(v)} 个，已抹掉***"
+                continue
+            safe[k] = v
+        try:
+            ver = getattr(ui_console, "APP_VERSION", "") if ui_console else ""
+        except Exception:
+            ver = ""
+        try:
+            wv = sys.getwindowsversion()
+            osname = f"Windows {wv.major}.{wv.minor} build {wv.build}"
+        except Exception:
+            osname = sys.platform
+        head = [
+            "【大肥鱼桌宠 · 诊断信息】",
+            f"界面版本：{ver or '（未知）'}",
+            f"系统：{osname}",
+            f"Python：{sys.version.split()[0]}",
+            f"配置目录：{USER_DIR}",
+            f"已抹掉：{'、'.join(redacted) if redacted else '（这个配置里没有密钥）'}",
+            "",
+        ]
+        return "\n".join(head) + json.dumps(safe, ensure_ascii=False, indent=2)
 
     def autosave_config(self):
         """配置有变化就顺手存一下，不用等到退出（被杀掉也不丢设置）。"""

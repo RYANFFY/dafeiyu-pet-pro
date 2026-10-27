@@ -19,7 +19,25 @@
 > 2026-10-27 由主人按 6 条主链路口头通过（细节项没逐条勾）；真正还剩的是
 > 「走路/跟随」和「素材边缘」两块 —— 这两块要在真机上跑起来看，比转头更依赖手感。
 
+## 2026-10-27 · 第五十轮（静态审查：文档 / 配置安全 / 密钥）
+
+- [x] README 的"11 个分类"改成 14（并写明可拖排序）；分类审计文档加"历史审计"说明
+- [x] `save_config()` 原子写（tmp + fsync + os.replace）+ 留 `config.bak.json`
+- [x] `load_json()` 坏了先留证（`config.broken.json`）→ 试备份 → 才退回默认值
+- [x] `diag_text()` + 设置→通用「复制诊断信息（不含密钥）」（hotkeys 不误抹）
+- [x] 新增 `test_config_atomic.py`（进 menu 6，现在 19 个脚本）
+- [ ] **拆分大文件**（静态审查第 4 条）：`桌宠.py` 12440 行 / `ui_console.py` 4928 行。
+      方案见下，**等主人点头再动**（纯搬运、零行为变化、分批做）：
+      1. `core/config.py`：DEFAULT_CONFIG / load_json / save_config / diag_text（约 400 行）
+      2. `core/screen.py`：多屏 / 窗口定位 / 吸附 / DPI（约 500 行）
+      3. `ui/menus.py`：右键菜单 + 经典菜单（约 800 行）
+      4. `ui/dialogs.py`：各种 QInputDialog / QMessageBox 包装（约 900 行）
+      5. `services/balance.py`、`services/weather.py`、`services/music.py`、`services/apps.py`
+        （余额 / 天气 / 音乐歌词 / 应用联动，各 300~700 行）
+      每步只搬不改，搬完跑一遍 `菜单 6` + `菜单 22~27` 再进下一步。
+
 ## 2026-10-27 · 第四十九轮（应用列表只留真应用 / 分类抓手 + 恢复默认）
+
 
 - [x] 扫描列表里全是命令行 / 运行时 / 系统组件（原来把**所有进程**都塞进去了）
       → 只收"有可见窗口且非工具窗口"的进程 + 系统黑名单 + 卸载器/更新器按名字挡
