@@ -11890,12 +11890,17 @@ class PetWindow(QWidget):
             if getattr(sys, "frozen", False):
                 # 打包版：`__file__` 在 `_internal` 里，既没有 `_relaunch.py` 也没有 `桌宠.py`，
                 # 照源码那条路走等于用 exe 去"跑脚本"——旧进程一退就再也回不来。
-                # 让 cmd 等两秒（约 ping 三次）再启动 exe 自己，等单实例锁释放。
+                # 让 cmd 等三秒（约 ping 四次）再启动 exe 自己，等单实例锁释放。
+                #
+                # ⚠️ 必须传**整条字符串**（shell=True），不能传列表：
+                # 传列表时 Python 的 list2cmdline 会把 `start ""` 那对空引号转义成 `\"\"`，
+                # 而 cmd 不认反斜杠转义 —— 它把 `\` 当成要启动的程序名，弹「Windows 找不到 '\'」，
+                # 鱼就再也回不来（v1.1.7 真机踩到，第六十轮修）。
                 exe = sys.executable
-                comspec = os.environ.get("COMSPEC") or "cmd.exe"
+                env = dict(os.environ, DAFEIYU_RESTARTING="1")
                 subprocess.Popen(
-                    [comspec, "/c", f'ping -n 3 127.0.0.1 >nul & start "" "{exe}"'],
-                    creationflags=flags)
+                    'ping -n 4 127.0.0.1 >nul & start "" "%s"' % exe,
+                    shell=True, env=env, creationflags=flags)
             else:
                 here = os.path.dirname(os.path.abspath(__file__))
                 helper = os.path.join(here, "_relaunch.py")
@@ -12875,13 +12880,23 @@ def main():
     server = None
     try:
         from PySide6.QtNetwork import QLocalServer, QLocalSocket
-        probe = QLocalSocket()
-        probe.connectToServer(SINGLE_INSTANCE_KEY)
-        if probe.waitForConnected(300):
-            probe.write(b"show")
-            probe.flush()
-            probe.waitForBytesWritten(300)
-            return 0
+        # 打包版「重启桌宠」是让 cmd 延迟拉起自己的：万一旧进程还没退干净，
+        # 这一次探测会连上那只**正在死**的旧进程 → 直接 return 0，鱼就再也不回来了。
+        # 所以带 DAFEIYU_RESTARTING 标记启动时，先给旧进程最多 6 秒退干净再判定。
+        restarting = os.environ.pop("DAFEIYU_RESTARTING", "") == "1"
+        deadline = time.monotonic() + 6.0
+        while True:
+            probe = QLocalSocket()
+            probe.connectToServer(SINGLE_INSTANCE_KEY)
+            if not probe.waitForConnected(300):
+                break                       # 没人在跑：正常启动
+            if not restarting or time.monotonic() > deadline:
+                probe.write(b"show")        # 真·还有另一只在跑：叫它出来，自己退出
+                probe.flush()
+                probe.waitForBytesWritten(300)
+                return 0
+            probe.abort()                   # 重启中：多半是旧进程还没退完，等一下再看
+            time.sleep(0.2)
         QLocalServer.removeServer(SINGLE_INSTANCE_KEY)
         server = QLocalServer()
         server.listen(SINGLE_INSTANCE_KEY)

@@ -22,6 +22,15 @@ installer itself can be deleted afterwards.
 - Packaged build keeps its settings in `%APPDATA%\大肥鱼桌宠\`
 - All versions and release notes: [Releases](https://github.com/RYANFFY/deepseek-dafeiyu-pet/releases)
 
+## 🆕 What's new in v1.1.8
+
+- **Fixed: "Restart pet" in the packaged build popped "Windows cannot find '\'" and the pet never came back.**
+  The command was handed to `cmd` as an argument list, so Python escaped the empty title quotes of
+  `start ""` into `\"\"` — and `cmd` does not understand backslash escapes, so it treated `\` as the
+  program to launch. The whole command is now passed as a single string through the shell; the delay
+  before relaunch went from 2s to 3s, and the new instance now waits for the old process to exit
+  before deciding "another pet is already running".
+
 ## 🆕 What's new in v1.1.7
 
 - **Throw it**: release while moving and it flies on with inertia, **bounces off the screen edge**,
