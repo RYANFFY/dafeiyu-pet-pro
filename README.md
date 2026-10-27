@@ -4,7 +4,8 @@ English | [中文](README.md) → [README.en.md](README.en.md)
 
 > **DeepSeek 桌宠 · DeepSeek 桌面宠物 · 大肥鱼 / 鲸鱼娘桌宠 · DeepSeek 余额挂件（独立桌面版，不依赖 DSH）·
 > DeepSeek Harness（DSH）小鲸鱼余额挂件同款能力：余额 / 今日已用 / 峰谷时段 / 每轮消耗统计 ·
-> Windows 双击即用 · 可拖拽吸附 / 左吸附翻面 / 数字滚动 / Q 弹音效**
+> Windows 双击即用 · 可拖拽吸附 / 左吸附翻面 / 松手甩出（惯性 + 撞边反弹）/ 数字滚动 / Q 弹音效 ·
+> 久坐 / 喝水提醒（默认关，谁需要谁开）**
 
 ## ⬇️ 下载即用（Windows）
 

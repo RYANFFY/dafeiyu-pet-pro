@@ -4,7 +4,9 @@
 
 > **Keywords**: DeepSeek desktop pet · DeepSeek 桌宠 · Da Fei Yu / 大肥鱼 / whale-girl pet ·
 > DeepSeek balance widget (standalone, no DSH required) · balance, today's spend, peak/off-peak hours,
-> per-turn cost · Windows, double-click to run · drag-to-snap, flip on left snap, rolling numbers, click sounds
+> per-turn cost · Windows, double-click to run · drag-to-snap, flip on left snap,
+> throw with inertia (bounces off screen edges), rolling numbers, click sounds ·
+> sedentary / water reminders (off by default)
 
 ## ⬇️ Download (Windows)
 
