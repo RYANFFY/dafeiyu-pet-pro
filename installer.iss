@@ -78,8 +78,12 @@ Name: "startmenu"; Description: "创建开始菜单快捷方式"; GroupDescripti
 Source: "dist\大肥鱼桌宠\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{autoprograms}\大肥鱼桌宠"; Filename: "{app}\{#MyAppExeName}"; Tasks: startmenu
-Name: "{autodesktop}\大肥鱼桌宠"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+; ⚠️ 2026-10-27：主人报「桌面快捷方式白纸」。查到最后是**这里**的问题 ——
+; 用资源管理器自己「发送到 → 桌面快捷方式」建的那条图标正常，
+; 而安装器建的这条是白纸（属性里能看到鱼，桌面就是不显示）。
+; 修法：**显式写上 IconFilename**，别让它自己去推断目标图标。
+Name: "{autoprograms}\大肥鱼桌宠"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"; IconIndex: 0; Tasks: startmenu
+Name: "{autodesktop}\大肥鱼桌宠"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"; IconIndex: 0; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "立刻运行大肥鱼桌宠"; Flags: nowait postinstall skipifsilent
