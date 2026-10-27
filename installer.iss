@@ -101,6 +101,9 @@ var
   OldUninst: String;
   DoUninstallOld: Boolean;
 
+{ 先声明一下（实现在下面「删目录前的安全闸」那节）：检测时就要用它验目录 }
+function LooksLikeOurInstall(const Dir: String): Boolean; forward;
+
 { ---------- 找旧版 ---------- }
 
 { 从某个卸载键里读「是不是我们」+ 位置 / 版本 / 卸载命令 }
@@ -124,6 +127,14 @@ begin
   { 位置读不到就按默认目录猜（老版本可能没写 InstallLocation） }
   if Dir = '' then
     Dir := ExpandConstant('{localappdata}\Programs\大肥鱼桌宠');
+  { ⚠️ 第 53 轮审查：光凭"显示名里有大肥鱼"就信这个路径太危险 ——
+    注册表里写歪一个 `D:\` 就会把整个盘当旧版目录。这里再加一道：
+    目录里得真有我们的 exe / unins000 / _internal，否则这个键不认。 }
+  if not LooksLikeOurInstall(Dir) then
+  begin
+    Dir := '';
+    Exit;
+  end;
   Result := DirExists(Dir);
 end;
 
@@ -214,16 +225,116 @@ begin
 end;
 
 { 目录页默认填旧版那个位置（卸载之后注册表就没了，所以现在就定下来）
-  ⚠️ 命令行给了 /DIR 就别覆盖它 —— 自动化安装 / 想装到别处时以参数为准 }
-procedure InitializeWizard();
+  ⚠️ 命令行给了 /DIR 就别覆盖它。
+  第 53 轮审查指出：原来靠"目录框是否等于默认值"猜有没有传 /DIR ——
+  用户明确传的路径刚好等于默认值时猜不出来。改成**直接看命令行有没有 /DIR=**。 }
+function DirParamGiven(): Boolean;
 var
-  DefaultDir: String;
+  S: String;
+begin
+  S := ExpandConstant('{param:DIR|}');
+  Result := (S <> '') or (Pos('/DIR=', Uppercase(GetCmdTail)) > 0);
+end;
+
+procedure InitializeWizard();
 begin
   if not (OldFound and (OldDir <> '')) then
     Exit;
-  DefaultDir := ExpandConstant('{localappdata}\Programs\大肥鱼桌宠');
-  if CompareText(WizardForm.DirEdit.Text, DefaultDir) = 0 then
-    WizardForm.DirEdit.Text := OldDir;
+  if DirParamGiven() then
+    Exit;                            { 命令行说了算 }
+  WizardForm.DirEdit.Text := OldDir;
+end;
+
+{ ---------- 删目录前的安全闸 ---------- }
+function CountChar(const S: String; C: Char): Integer;
+var
+  I: Integer;
+begin
+  Result := 0;
+  for I := 1 to Length(S) do
+    if S[I] = C then
+      Result := Result + 1;
+end;
+
+{ 这些"位置本身"绝对不能删（子目录另说） }
+function IsForbiddenDir(const D: String): Boolean;
+var
+  List: array of String;
+  I: Integer;
+  X: String;
+begin
+  Result := False;
+  X := RemoveBackslashUnlessRoot(Uppercase(D));
+  SetArrayLength(List, 10);
+  List[0] := ExpandConstant('{sd}\');
+  List[1] := ExpandConstant('{win}');
+  List[2] := ExpandConstant('{sys}');
+  List[3] := ExpandConstant('{userprofile}');
+  List[4] := ExpandConstant('{userdocs}');
+  List[5] := ExpandConstant('{userdesktop}');
+  List[6] := ExpandConstant('{localappdata}');
+  List[7] := ExpandConstant('{appdata}');
+  List[8] := ExpandConstant('{autopf}');
+  List[9] := ExpandConstant('{tmp}');
+  for I := 0 to GetArrayLength(List) - 1 do
+  begin
+    if List[I] = '' then
+      Continue;
+    if X = RemoveBackslashUnlessRoot(Uppercase(List[I])) then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
+{ 这个目录里到底有没有我们的东西 }
+function LooksLikeOurInstall(const Dir: String): Boolean;
+var
+  D: String;
+begin
+  D := AddBackslash(Dir);
+  Result := FileExists(D + '{#MyAppExeName}')
+         or FileExists(D + 'unins000.exe')
+         or DirExists(D + '_internal');
+end;
+
+{ 删之前必须过的一关：不能是盘根 / 系统目录，而且里面得有我们的文件。
+  ⚠️ 别用"路径层级太浅就拒"这种规则 —— 装在 `D:\大肥鱼桌宠` 是很正常的，
+  一刀切会把正当安装也挡掉（实测差点把自己坑了）。真正靠得住的是最后那条：
+  **目录里必须有大肥鱼桌宠.exe / unins000.exe / _internal**。 }
+function IsSafeToDeleteDir(const Dir: String): Boolean;
+var
+  D: String;
+begin
+  Result := False;
+  D := RemoveBackslashUnlessRoot(Trim(Dir));
+  if Length(D) < 4 then                       { C:\x 最少 4 个字符 }
+    Exit;
+  if (Length(D) = 3) and (D[2] = ':') then    { D:\ 这种盘根 }
+    Exit;
+  if CountChar(D, '\') < 1 then               { 盘根下面至少得有一层 }
+    Exit;
+  if IsForbiddenDir(D) then
+    Exit;
+  Result := LooksLikeOurInstall(D);
+end;
+
+{ 旧版目录：能安全删才删，删不了就中止安装（绝不瞎删） }
+function RemoveOldDirSafely(const Dir: String; var ErrMsg: String): Boolean;
+begin
+  Result := False;
+  if not IsSafeToDeleteDir(Dir) then
+  begin
+    ErrMsg := '旧版装在：' + Dir + #13#10#13#10 +
+              '这个位置我不敢直接删（怕误删别的东西）。' + #13#10 +
+              '请先用旧版自己的卸载程序手动卸掉，再重新运行这个安装包。';
+    Exit;
+  end;
+  Result := DelTree(Dir, True, True, True);
+  if not Result then
+    ErrMsg := '旧版目录删不掉：' + Dir + #13#10#13#10 +
+              '可能有文件被占用。请关掉桌宠 / 重启后再试，或手动卸载旧版。';
 end;
 
 { ---------- 真正开工前：关掉正在跑的 + 卸载旧版 ---------- }
@@ -231,6 +342,7 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   R: Integer;
   UninstExe: String;
+  ErrMsg: String;
 begin
   Result := '';
   NeedsRestart := False;
@@ -242,23 +354,24 @@ begin
   if not DoUninstallOld then
     Exit;
 
-  if OldUninst = '' then
+  { 有卸载器：跑它；跑不起来就**中止**，不再自己删目录
+    （第 53 轮审查：原来卸载失败会 DelTree，路径要是读歪了就删错东西） }
+  if OldUninst <> '' then
   begin
-    { 没有卸载器（绿色版 / 注册表残缺）→ 直接把旧目录删掉，反正配置不在里面 }
-    DelTree(OldDir, True, True, True);
-    Exit;
+    UninstExe := RemoveQuotes(OldUninst);
+    if FileExists(UninstExe) then
+    begin
+      if Exec(UninstExe, '/SILENT /SUPPRESSMSGBOXES /NORESTART', '', SW_SHOW,
+              ewWaitUntilTerminated, R) then
+        Exit;                        { 卸载器跑完了，接着装 }
+      Result := '旧版卸载程序没能正常运行。' + #13#10#13#10 +
+                '请先手动卸载旧版（设置 → 应用 → 大肥鱼桌宠），再重新运行这个安装包。';
+      Exit;
+    end;
   end;
 
-  UninstExe := RemoveQuotes(OldUninst);
-  if not FileExists(UninstExe) then
-  begin
-    DelTree(OldDir, True, True, True);
+  { 没有卸载器（绿色版 / 注册表残缺）：**过安全闸**才敢删 }
+  if RemoveOldDirSafely(OldDir, ErrMsg) then
     Exit;
-  end;
-  { /SILENT 静默卸（不弹向导），/SUPPRESSMSGBOXES 别弹确认框，
-    /NORESTART 绝不重启电脑；等它跑完再往下装 }
-  if not Exec(UninstExe, '/SILENT /SUPPRESSMSGBOXES /NORESTART', '', SW_SHOW,
-              ewWaitUntilTerminated, R) then
-    MsgBox('旧版卸载器没跑起来，我会直接覆盖安装。' + #13#10 +
-           '要是装完发现行为不对，请手动卸载旧版再装一次。', mbInformation, MB_OK);
+  Result := ErrMsg;
 end;

@@ -4368,15 +4368,17 @@ class PetWindow(QWidget):
         """
         safe, redacted = {}, []
         for k, v in self.cfg.items():
+            # ⚠️ other_keys 必须**先判**：它的名字里有 `_key`，会被下面的通用规则先吃掉，
+            # 那样"几个 Key 已抹掉"这句就永远不出现（第 53 轮静态审查提的）。
+            if k == "other_keys" and v:
+                redacted.append(k)
+                safe[k] = f"***{len(v)} 个，已抹掉***"
+                continue
             kl = str(k).lower()
             if any(t in kl for t in self._SECRET_HINTS) and not any(
                     t in kl for t in self._NOT_SECRET):
                 redacted.append(k)
                 safe[k] = "***已抹掉***" if v else ""
-                continue
-            if k == "other_keys" and v:
-                redacted.append(k)
-                safe[k] = f"***{len(v)} 个，已抹掉***"
                 continue
             safe[k] = v
         try:
