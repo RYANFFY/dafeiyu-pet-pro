@@ -1310,6 +1310,17 @@ APP_LABELS = {
     "qq.exe": "QQ", "wechat.exe": "微信", "weixin.exe": "微信",
     "qqmusic.exe": "QQ音乐", "cloudmusic.exe": "网易云音乐",
     "obs64.exe": "OBS", "photoshop.exe": "Photoshop", "taskmgr.exe": "任务管理器",
+    # 2026-10-27 补的一批常见游戏 / 客户端：主人加了「守望先锋」，界面上却只显示
+    # "overwatch"（exe 名）—— 这里补上中文名。没列到的仍然会退化成 exe 名。
+    "overwatch.exe": "守望先锋", "overwatch launcher.exe": "守望先锋（启动器）",
+    "dota2.exe": "DOTA2", "cs2.exe": "CS2",
+    "valorant.exe": "无畏契约", "valorant-win64-shipping.exe": "无畏契约",
+    "pubg.exe": "PUBG", "lol.exe": "英雄联盟", "leagueclient.exe": "英雄联盟",
+    "honkaistarrail.exe": "崩坏：星穹铁道", "wutheringwaves.exe": "鸣潮",
+    "zenlesszonezero.exe": "绝区零", "yuanshen.exe": "原神",
+    "discord.exe": "Discord", "telegram.exe": "Telegram", "spotify.exe": "Spotify",
+    "bilibili.exe": "哔哩哔哩", "dingtalk.exe": "钉钉", "feishu.exe": "飞书",
+    "wps.exe": "WPS", "winword.exe": "Word", "excel.exe": "Excel",
 }
 SUMMARY_MIN_SECONDS = 20 * 60      # 小结里至少用了这么久才点名（按时间从长到短取前两条）
 SUMMARY_MAX_APPS = 2

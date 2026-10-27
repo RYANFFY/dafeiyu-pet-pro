@@ -3594,10 +3594,8 @@ class ConsoleWindow(QWidget):
         page.row(card, "应用启动提醒", "可为每个应用单独设置提示文字",
                  Switch(pet.process_alerts, pet.set_process_alerts))
         page.buttons(card, [
-            ("扫描本机应用并添加…",
-             lambda: self._run(pet.scan_apps_dialog), "primary", "ui.spinner"),
-            ("清理自定义文字…",
-             lambda: self._run(pet.remove_custom_app_dialog), "danger", "ui.delete"),
+            ("扫描本机应用并添加…", self._add_apps, "primary", "ui.spinner"),
+            ("清理自定义文字…", self._clean_apps, "danger", "ui.delete"),
         ])
         page.hint(card, "每个应用可单独设置提示文字；未添加的应用不受影响。")
         # 这里原来挂的是一张「尚未配置应用提示」的空状态插图 —— 但**内置那 18 个应用
@@ -3702,7 +3700,13 @@ class ConsoleWindow(QWidget):
                 label.setText(fn())
 
     def _integration_text(self):
-        """「应用启动提醒」现在到底在盯哪些应用（内置 18 个默认就在盯）。"""
+        """「应用启动提醒」现在到底在盯哪些应用 —— **你自己加的要排在最前面**。
+
+        ⚠️ 主人 2026-10-27：「我加了守望先锋也没显示啊」。
+        原来这里只列合并表的**前 5 个**，而自定义的应用是**追加在最后**的（内置 18 个在前），
+        所以自己加的一个都挤不进去，看着就像"没加上"。
+        现在先报"你自己加的"，再报内置数量；加完 / 删完立刻重算（见按钮回调里的 _refresh_page）。
+        """
         pet = self.pet
         try:
             merged = pet._process_lines_map() or {}
@@ -3710,18 +3714,40 @@ class ConsoleWindow(QWidget):
             merged = {}
         custom = pet.cfg.get("custom_process_lines") or {}
         overrides = pet.cfg.get("default_line_overrides") or {}
-        if not merged:
-            return "现在没有可提示的应用。点「扫描本机应用并添加…」加一个。"
+        builtin_n = max(0, len(merged) - len(custom))
+        parts = []
+        if custom:
+            names = []
+            for exe in list(custom)[:8]:
+                try:
+                    names.append(pet.app_label(exe))
+                except Exception:
+                    names.append(str(exe))
+            tail = f" 等 {len(custom)} 个" if len(custom) > 8 else ""
+            parts.append(f"你自己加的：{'、'.join(names)}{tail}")
+        if overrides:
+            parts.append(f"改过台词的：{len(overrides)} 个")
+        parts.append(f"内置 {builtin_n} 个应用默认就在盯")
+        if not custom:
+            parts.append("想加别的点「扫描本机应用并添加…」")
+        # 顺带说一句「使用时长」里配了几个 —— 那是另一张卡的表，用户常以为是同一个
         try:
-            names = [pet.app_label(e) for e in list(merged)[:5]]
+            n_time = len([r for r in (pet.app_time_rules() or {}).values()
+                          if isinstance(r, dict) and r.get("on", True)])
         except Exception:
-            names = [str(e) for e in list(merged)[:5]]
-        n = len(merged)
-        tail = f" 等 {n} 个" if n > 5 else f"（共 {n} 个）"
-        extra = ""
-        if custom or overrides:
-            extra = f"；其中 {len(custom)} 个是你自己加的、{len(overrides)} 个改过台词"
-        return f"现在盯着：{'、'.join(names)}{tail}{extra}。内置应用默认就有提示，不用另配。"
+            n_time = 0
+        if n_time:
+            parts.append(f"另外「使用时长」里配了 {n_time} 个")
+        return "；".join(parts) + "。"
+
+    def _add_apps(self):
+        """扫描并添加应用；回来立刻把下面那行字重算一遍（不然刚加的看不见）。"""
+        self._run(self.pet.scan_apps_dialog)
+        self._refresh_page("integration")
+
+    def _clean_apps(self):
+        self._run(self.pet.remove_custom_app_dialog)
+        self._refresh_page("integration")
 
     def _sync_integration_hint(self):
         hint = getattr(self, "integration_hint", None)
