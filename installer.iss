@@ -188,7 +188,7 @@ begin
   end;
 
   { 3) 注册表里没有，但默认目录里躺着我们的 exe → 也算旧版（绿色版 / 手工装过） }
-  if FileExists(ExpandConstant('{localappdata}\Programs\大肥鱼桌宠\{#MyAppExeName}')) then
+  if LooksLikeOurInstall(ExpandConstant('{localappdata}\Programs\大肥鱼桌宠')) then
   begin
     OldFound := True;
     OldDir := ExpandConstant('{localappdata}\Programs\大肥鱼桌宠');
@@ -288,15 +288,47 @@ begin
   end;
 end;
 
-{ 这个目录里到底有没有我们的东西 }
-function LooksLikeOurInstall(const Dir: String): Boolean;
+{ 路径规范化：去首尾空白、去掉结尾多余的 `\`（C:\a\ 和 C:\a 当成同一个） }
+function NormalizeDir(const Dir: String): String;
 var
   D: String;
 begin
-  D := AddBackslash(Dir);
-  Result := FileExists(D + '{#MyAppExeName}')
-         or FileExists(D + 'unins000.exe')
-         or DirExists(D + '_internal');
+  D := Trim(Dir);
+  while (Length(D) > 3) and (D[Length(D)] = '\') do
+    Delete(D, Length(D), 1);
+  Result := D;
+end;
+
+{ 目录里有卸载器吗（unins000.exe / unins001.exe … 名字不固定） }
+function HasUninstaller(const Dir: String): Boolean;
+var
+  SR: TFindRec;
+begin
+  Result := False;
+  if FindFirst(AddBackslash(NormalizeDir(Dir)) + 'unins*.exe', SR) then
+  begin
+    Result := True;
+    FindClose(SR);
+  end;
+end;
+
+{ 这个目录到底是不是**我们的安装目录**。
+  ⚠️ 第 54 轮审查：原来"exe / unins000 / _internal 命中任意一个就算"太宽松 ——
+  别的软件目录里碰巧有个 `_internal` 就会被认成旧版然后删掉。
+  现在要求**多个专属标记**：必须有大肥鱼桌宠.exe，**并且**还要有 _internal 或卸载器。 }
+function LooksLikeOurInstall(const Dir: String): Boolean;
+var
+  D: String;
+  HasExe: Boolean;
+begin
+  Result := False;
+  D := AddBackslash(NormalizeDir(Dir));
+  if not DirExists(D) then
+    Exit;
+  HasExe := FileExists(D + '{#MyAppExeName}');
+  if not HasExe then
+    Exit;
+  Result := DirExists(D + '_internal') or HasUninstaller(D);
 end;
 
 { 删之前必须过的一关：不能是盘根 / 系统目录，而且里面得有我们的文件。
@@ -322,18 +354,21 @@ end;
 
 { 旧版目录：能安全删才删，删不了就中止安装（绝不瞎删） }
 function RemoveOldDirSafely(const Dir: String; var ErrMsg: String): Boolean;
+var
+  D: String;
 begin
   Result := False;
-  if not IsSafeToDeleteDir(Dir) then
+  D := NormalizeDir(Dir);              { 删之前先规范化，别带着结尾的 `\` 去删 }
+  if not IsSafeToDeleteDir(D) then
   begin
-    ErrMsg := '旧版装在：' + Dir + #13#10#13#10 +
+    ErrMsg := '旧版装在：' + D + #13#10#13#10 +
               '这个位置我不敢直接删（怕误删别的东西）。' + #13#10 +
               '请先用旧版自己的卸载程序手动卸掉，再重新运行这个安装包。';
     Exit;
   end;
-  Result := DelTree(Dir, True, True, True);
+  Result := DelTree(D, True, True, True);
   if not Result then
-    ErrMsg := '旧版目录删不掉：' + Dir + #13#10#13#10 +
+    ErrMsg := '旧版目录删不掉：' + D + #13#10#13#10 +
               '可能有文件被占用。请关掉桌宠 / 重启后再试，或手动卸载旧版。';
 end;
 
@@ -354,18 +389,21 @@ begin
   if not DoUninstallOld then
     Exit;
 
-  { 有卸载器：跑它；跑不起来就**中止**，不再自己删目录
-    （第 53 轮审查：原来卸载失败会 DelTree，路径要是读歪了就删错东西） }
+  { 有卸载器：跑它。
+    ⚠️ 第 54 轮审查：`Exec` 返回 True 只代表"启动成功"，不代表卸载成功 ——
+    必须看退出码；退出码不对且旧目录还在，就**中止**，让主人手动卸。 }
   if OldUninst <> '' then
   begin
     UninstExe := RemoveQuotes(OldUninst);
     if FileExists(UninstExe) then
     begin
       if Exec(UninstExe, '/SILENT /SUPPRESSMSGBOXES /NORESTART', '', SW_SHOW,
-              ewWaitUntilTerminated, R) then
-        Exit;                        { 卸载器跑完了，接着装 }
-      Result := '旧版卸载程序没能正常运行。' + #13#10#13#10 +
-                '请先手动卸载旧版（设置 → 应用 → 大肥鱼桌宠），再重新运行这个安装包。';
+              ewWaitUntilTerminated, R) and (R = 0) then
+        Exit;                        { 卸载成功，接着装 }
+      if not LooksLikeOurInstall(OldDir) then
+        Exit;                        { 退出码不为 0，但东西确实没了 —— 也算成功 }
+      Result := '旧版卸载程序没卸干净（退出码 ' + IntToStr(R) + '）。' + #13#10#13#10 +
+                '请手动卸载旧版（设置 → 应用 → 大肥鱼桌宠），再重新运行这个安装包。';
       Exit;
     end;
   end;
@@ -374,4 +412,17 @@ begin
   if RemoveOldDirSafely(OldDir, ErrMsg) then
     Exit;
   Result := ErrMsg;
+end;
+
+{ ---------- 装完：让外壳重新读一遍图标 ---------- }
+{ ⚠️ 主人 2026-10-27：「桌面快捷方式又变白了」。
+   升级时 exe 换了新文件，但 Windows 的图标缓存还留着旧的（甚至是坏的那条），
+   桌面就一直显示一张白纸。装完主动通知外壳刷新一次，比让用户去清缓存靠谱。 }
+procedure SHChangeNotify(EventId: Longint; Flags: Cardinal; Item1, Item2: Longint);
+  external 'SHChangeNotify@shell32.dll stdcall';
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    SHChangeNotify($08000000, $1000, 0, 0);   { SHCNE_ASSOCCHANGED | SHCNF_FLUSH }
 end;
