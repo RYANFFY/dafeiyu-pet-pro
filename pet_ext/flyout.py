@@ -339,12 +339,13 @@ class FlyoutWindow(QWidget):
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        # ⚠️ 最小尺寸放 0：状态行 / 停止键 / chip 出现时，让消息区**自己让位**，
-        # 而不是把整块板子顶高（主人 2026-10-27：「文案会让窗口越来越长」）。
-        # 只写 setMinimumHeight(0) 不够 —— 布局在"没显式设过"时会退回 minimumSizeHint（实测 54），
-        # 所以这里用 setMinimumSize(0, 0) + Ignored 策略。
-        self.scroll.setMinimumSize(0, 0)
-        self.scroll.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        # ⚠️ 最小尺寸：给消息区留一块**看得见**的地方。
+        # 只写 0 的话，板子矮的时候（20% 档 240 高）标题 + 交给谁 + 两行 chip + 输入框
+        # 就把高度吃光，消息区被挤成 0 —— 拖进来的文件列表直接看不见
+        # （主人 2026-10-27 截图：「选项显示不全」）。
+        # 高度不够时让**窗口**长高（Qt 会按布局最小尺寸顶上去），宽度仍然锁死不动。
+        self.scroll.setMinimumSize(0, 70)
+        self.scroll.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.body = QWidget()
         self.body.setObjectName("body")
         self.msgs = QVBoxLayout(self.body)
@@ -771,6 +772,21 @@ class FlyoutWindow(QWidget):
         """这排 chip 的全部按钮（跨行，按显示顺序）。"""
         return [b for b in getattr(self, "_chip_btns", []) if b is not None]
 
+    def _inner_w(self):
+        """卡片**里面**真正能用的宽度。
+
+        ⚠️ 不能拿 `self.width() - 2*MARGIN` 当可用宽：卡片自己还有左右各 14 的内边距
+        （`lay.setContentsMargins(14, 12, 14, 12)`）。少算这 28px，按钮就会比卡片宽、
+        右边被卡片裁掉（主人 2026-10-27：「按钮显示不全，右边给截断了一部分」）。
+        """
+        try:
+            w = self.card.width()
+            if w > 40:
+                return max(100, w - 28)
+        except (RuntimeError, AttributeError):
+            pass
+        return max(100, self.width() - 2 * MARGIN - 28)
+
     def _fit_chips(self):
         """按当前宽度安排这排 chip：**先按真实宽度试一行，放不下就换两行**。
 
@@ -785,7 +801,7 @@ class FlyoutWindow(QWidget):
         btns = self.chip_buttons()
         if not btns:
             return
-        _fit_chipbox(self.actions_box, btns, self.width() - 2 * MARGIN - 12)
+        _fit_chipbox(self.actions_box, btns, self._inner_w())
 
     def _clear_quick_actions(self):
         """清空那排 chip。⚠️ `_dfy_cb` 要一起清，否则复用时会去 disconnect 死对象。"""
@@ -897,7 +913,7 @@ class FlyoutWindow(QWidget):
             btns.append(btn)
         chipbox._dfy_btns = btns
         v.addWidget(chipbox)
-        _fit_chipbox(chipbox, btns, max(120, self.width() - 2 * MARGIN - 20))
+        _fit_chipbox(chipbox, btns, max(100, self._inner_w() - 8))
         self.msgs.insertWidget(self.msgs.count() - 1, box)
         # ⚠️ 宽度要在进了布局之后算（和 add 里同一个理由）
         self._fit_bubble(b)
@@ -1525,7 +1541,7 @@ class FlyoutWindow(QWidget):
         try:
             for cb in self.body.findChildren(_ChipBox):
                 _fit_chipbox(cb, getattr(cb, "_dfy_btns", []),
-                             max(120, self.width() - 2 * MARGIN - 20))
+                             max(100, self._inner_w() - 8))
         except (RuntimeError, AttributeError):
             pass
 
