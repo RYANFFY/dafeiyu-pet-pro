@@ -13,7 +13,8 @@ English | [中文](README.md) → [README.en.md](README.en.md)
 
 ### 👉 [**点这里下载最新版（Windows 安装版）**](https://github.com/RYANFFY/deepseek-dafeiyu-pet/releases/latest/download/dafeiyu-pet-setup.exe)
 
-约 73MB 的中文安装包：**双击一路「下一步」就行，中间那一步能自己选装在哪儿**
+约 257MB 的中文安装包（大头是 239MB 的灵动版动作素材）：**双击一路「下一步」就行，
+中间那一步能自己选装在哪儿**
 （默认装在当前用户目录，不弹管理员提示），装完桌面和开始菜单就有它；
 **安装包本身可以直接删掉**。（这个链接永远指向最新版，可以直接收藏）
 
