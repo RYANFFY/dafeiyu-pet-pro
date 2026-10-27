@@ -244,6 +244,7 @@ class ChatExtension(QObject):
         self._opened_once = False
         self._bubble = None           # 桌宠右上角那个圆形按钮（设置里可关）
         self._flyout_hooked = False   # 有没有连上浮窗的 closed 信号
+        self._flyout_open = False     # 聊天板子现在是不是开着（开着就不许圆按钮冒出来）
         self._refreshing = False      # `refresh_bubble` 的防重入（见那个方法）
         # 默认是 AutoConnection：emit 发生在 worker 线程 → 槽函数排队回主线程执行
         self.reply_ready.connect(self._on_reply)
@@ -281,6 +282,7 @@ class ChatExtension(QObject):
             pass
 
     def _on_flyout_closed(self):
+        self._flyout_open = False      # 板子收起来了 → 圆按钮该回来了
         self.refresh_bubble()
 
     def _tokens(self):
@@ -296,6 +298,15 @@ class ChatExtension(QObject):
             self._bubble = ChatCircle(self)
         self._bubble.apply_theme()
         self._bubble.reposition()
+        # ⚠️ 板子开着的时候**不许**把圆按钮放出来。
+        # 主人 2026-10-27：「在打开聊天窗口的情况下调整了桌宠大小，圆按钮会自动再次出现」
+        # —— 拖大小滑块时设置页会把「聊天入口」开关重新初始化一遍 → set_chat_bubble()
+        # → 这里被调到 → 圆又冒出来压在聊天窗口上。
+        # 用自己记的标记（不用 fly.visible）：收起动画第一帧 `closing` 就要把圆放回来，
+        # 那会儿窗口还是可见的，按 visible 判会把"缩进圆里"的效果弄没。
+        if self._flyout_open:
+            self._bubble.hide()
+            return self._bubble
         self._bubble.show()
         self._bubble.raise_()
         return self._bubble
@@ -395,6 +406,7 @@ class ChatExtension(QObject):
             win = fly.show_from_circle(circle_rect, title="和她聊聊", anchor_y=anchor_y)
         else:
             win = fly.show(title="和她聊聊", anchor_y=anchor_y)
+        self._flyout_open = True      # 记下来：板子开着的时候圆按钮不许冒出来
         if fly.message_count() == 0 and not self._opened_once:
             self._opened_once = True
             if not self._key():
