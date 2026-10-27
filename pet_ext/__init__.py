@@ -21,10 +21,11 @@ def load_extensions(pet):
     from . import dispatch as dispatch_ext
     from . import flyout as flyout_ext
     from . import notify as notify_ext
+    from . import rest as rest_ext
 
     loaded = {}
     # 顺序有意义：chat 要用 flyout 那块板子，所以 flyout 先加载
-    for mod in (notify_ext, anim_ext, flyout_ext, chat_ext, dispatch_ext):
+    for mod in (notify_ext, anim_ext, flyout_ext, chat_ext, dispatch_ext, rest_ext):
         name = mod.__name__.rsplit(".", 1)[-1]
         try:
             got = mod.setup(pet)

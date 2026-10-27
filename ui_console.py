@@ -3384,6 +3384,10 @@ class ConsoleWindow(QWidget):
                  Switch(pet.snap_on, pet.set_snap))
         page.row(card, "左吸附时翻面", "吸附左侧时朝向屏幕内侧",
                  Switch(pet.flip_on_left, pet.set_flip_on_left))
+        # 甩出惯性（GitHub issue #2）：以前松手就瞬移贴边，台词里却喊着「飞起来咯」。
+        # 现在按松手时的速度滑一段再吸附；轻轻放下的还是老样子直接贴边。
+        page.row(card, "松手甩出去", "甩一下会带着惯性滑一段，停下再吸附",
+                 Switch(pet.fling_on, pet.set_drag_fling))
 
         self._card_what_it_does(page)
 
@@ -3662,6 +3666,39 @@ class ConsoleWindow(QWidget):
                              self._open_timed, "primary", "ui.edit")])
         self.timed_hint = page.hint(card, self._timed_text(), "muted")
 
+        # 工作与休息提醒（GitHub issue #3）：久坐 / 喝水。
+        # **默认关着** —— 主人本人不喜欢这类定时提醒（2026-09-14 亲手删过番茄钟），
+        # 但 issue 里有人需要，所以做成一个开关：谁需要谁打开。
+        # 关着的时候扩展一步都不走、一句话都不说（见 pet_ext/rest.py 开头）。
+        box = pet.cfg.get("rest_reminder")
+        if not isinstance(box, dict):
+            box = {}
+        card = page.card("工作与休息", "久坐提醒 / 喝水提醒（默认关着）", "ui.timer")
+        page.row(card, "工作与休息提醒", "连续用电脑到设定时长，提醒你起来动动",
+                 Switch(bool(box.get("on", False)),
+                        lambda on: self._run(pet.set_rest_option, "on", bool(on))))
+        page.slider(card, "工作时长", "坐这么久就提醒一次",
+                    15, 120, int(box.get("work_min", 45) or 45), " 分钟",
+                    lambda v: self._run(pet.set_rest_option, "work_min", int(v)))
+        page.slider(card, "休息多久", "提醒之后这段时间不再打扰",
+                    3, 30, int(box.get("break_min", 5) or 5), " 分钟",
+                    lambda v: self._run(pet.set_rest_option, "break_min", int(v)))
+        page.row(card, "喝水提醒", "到点提醒你喝口水",
+                 Switch(bool(box.get("water_on", True)),
+                        lambda on: self._run(pet.set_rest_option, "water_on", bool(on))))
+        page.slider(card, "喝水间隔", "隔这么久提醒一次",
+                    20, 180, int(box.get("water_min", 60) or 60), " 分钟",
+                    lambda v: self._run(pet.set_rest_option, "water_min", int(v)))
+        page.buttons(card, [
+            ("现在休息一下", lambda: self._run(pet.rest_start_break),
+             "primary", "ui.timer"),
+            ("重新计时", lambda: self._run(pet.rest_reset), None, "ui.reset"),
+        ])
+        self.rest_hint = page.hint(card, self._rest_text(), "muted")
+        self._hook_page("integration", self._sync_rest_text)
+        page.hint(card, "台词在「文案和语录 → 台词内容」里的「久坐休息提醒」「喝水提醒」两组，"
+                        "也能在「语录板块」里整块关掉。")
+
         card = page.card("全局快捷键", "在任意窗口按组合键触发",
                          "ui.keyboard")
         page.row(card, "全局快捷键", "按键与动作都可自定义",
@@ -3794,6 +3831,18 @@ class ConsoleWindow(QWidget):
         hint = getattr(self, "integration_hint", None)
         if hint is not None:
             hint.setText(self._integration_text())
+
+    def _rest_text(self):
+        """「工作与休息」那张卡下面那行：现在到底在不在计时。"""
+        try:
+            return self.pet.rest_status_text()
+        except Exception:
+            return ""
+
+    def _sync_rest_text(self):
+        hint = getattr(self, "rest_hint", None)
+        if hint is not None:
+            hint.setText(self._rest_text())
 
     # ---------------- 性能与工具 ----------------
     def _page_performance(self, page):

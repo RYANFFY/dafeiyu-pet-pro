@@ -497,6 +497,22 @@ BACK_LINES = [
     "欢迎回来～我刚刚打了个小盹",
 ]
 
+# 工作与休息提醒（GitHub issue #3）：坐太久该起来动动 / 该喝水了。
+# 计时逻辑在 `pet_ext/rest.py`，这里只放台词 —— 放这儿才能被「台词内容…」编辑器认出来。
+REST_LINES = [
+    "起来动动嘛，坐了好久了，腰要断啦",
+    "歇一会儿吧，我帮你看会儿屏幕（其实是发呆）",
+    "站起来走两步嘛，我帮你数着时间",
+    "眼睛也歇歇，看看远处那棵树（有的话）",
+    "坐这么久了，去倒杯水顺便走一圈？",
+]
+WATER_LINES = [
+    "喝口水嘛，嘴巴干干的我会心疼",
+    "水杯空了吧？去接一杯，我等你",
+    "该喝水啦，别等渴了才想起来",
+    "咕嘟咕嘟——你也来一口",
+]
+
 # 切成某一档「语录频率」时冒的话（每档都能在「台词内容…」里自己改写）
 FREQ_LINES = {
     "安静": ["行行行，我闭嘴，安静得像块小石头",
@@ -518,6 +534,8 @@ LINE_GROUPS = [
     ("DRAG_LINES", "拖拽时"),
     ("DOUBLE_CLICK_LINES", "快速双击时（自己写）"),
     ("BACK_LINES", "离开 / 返回时（{away} = 离开时长）"),
+    ("REST_LINES", "久坐休息提醒"),
+    ("WATER_LINES", "喝水提醒"),
     ("MUSIC_CLICK_LINES", "放歌时点击（{song} = 歌名——歌手）"),
     ("MUSIC_START_LINES", "换歌时（同上）"),
     ("FREQ_LINES_安静", "语录频率·安静（切换档位时）"),
@@ -537,6 +555,8 @@ LINE_SECTIONS = [
     ("react", "点击回嘴", "点它一下之后回你的话", ["REACT_LINES"]),
     ("drag", "拖拽时", "把它拖来拖去、松手时说的话", ["DRAG_LINES"]),
     ("back", "离开 / 返回时", "离开半小时以上、回来时打的那句招呼", ["BACK_LINES"]),
+    ("rest", "久坐 / 喝水提醒", "坐太久该起来动动、该喝水时说的那两句",
+     ["REST_LINES", "WATER_LINES"]),
     ("music_click", "放歌时点击", "放着歌的时候点它，说的那一句", ["MUSIC_CLICK_LINES"]),
     ("music_start", "换歌时", "切到下一首时冒的那一句", ["MUSIC_START_LINES"]),
     ("freq", "语录频率切换时", "把语录频率换成安静 / 正常 / 话多 / 话痨时说的话",
@@ -1337,6 +1357,52 @@ SUMMARY_MAX_APPS = 2
 BACK_AWAY_SECONDS = 1800           # 键鼠静这么久算"你走开了"，回来打个招呼
 FULLSCREEN_REPORT_MIN = 180        # 全屏至少持续这么久，攒下的提醒才汇报
 QUIET_DEFAULT_MIN = 30
+
+# ===== 拖拽甩出惯性（GitHub issue #2）=====
+# 松手时按**拖动末段的速度**给一个初速度：滑出去 → 减速 → 停下 → 再吸附四边。
+# 以前是松手瞬间 `_snap_to_edge()` 直接把坐标设成屏幕边（瞬移），
+# 而台词里早就在喊「飞起来咯」—— 手感对不上，这条就是补上那口气。
+# 单位：像素 / 像素每秒 / 秒。都是按"20ms 一帧、1440p 屏"试出来的手感值。
+FLING_SAMPLE_SEC = 0.13        # 取松手前这段时间内的位移算速度
+FLING_SAMPLE_MAX_AGE = 0.09    # 最后一个采样点比这还旧 → 手先停住再松的，不甩
+FLING_MIN_SPEED = 260          # 低于这个速度就当没甩，还走老的"松手即吸附"
+FLING_MAX_SPEED = 2200         # 甩太狠也夹一下，别一甩飞出半个屏
+FLING_DECAY = 3.0              # 指数衰减（1/s）：越大停得越快
+FLING_DRAG = 320               # 线性减速（px/s²）：保证尾巴真的停住，不无限蹭
+FLING_STOP_SPEED = 55          # 低于这个速度算停了 → 收尾吸附
+FLING_MAX_SECONDS = 1.6        # 兜底：再久也强制停（参数调歪了也不会一直滑）
+
+
+def fling_velocity(samples, now):
+    """从拖动采样里算松手速度（px/s）。`samples` = [(t, x, y), ...]，t 是 perf_counter。
+
+    抽成模块级纯函数是为了能离线测（`_test/test_fling.py`），不依赖窗口。
+    只取最近 `FLING_SAMPLE_SEC` 内的点：更早的那段是"手已经拐弯了"，
+    掺进来会把方向算歪（甩出去的方向和最后一下的走向对不上）。
+    """
+    if not samples:
+        return 0.0, 0.0
+    t1, x1, y1 = samples[-1]
+    if now - t1 > FLING_SAMPLE_MAX_AGE:
+        return 0.0, 0.0                  # 停住了一会儿才松手：没有惯性
+    cut = t1 - FLING_SAMPLE_SEC
+    pts = [s for s in samples if s[0] >= cut]
+    if len(pts) < 2:
+        return 0.0, 0.0
+    t0, x0, y0 = pts[0]
+    dt = t1 - t0
+    if dt <= 0.008:                      # 采样太密：除以近 0 的数会炸出天文数字
+        return 0.0, 0.0
+    return (x1 - x0) / dt, (y1 - y0) / dt
+
+
+def clamp_fling_speed(vx, vy, vmax=FLING_MAX_SPEED):
+    """把甩出的速度夹到上限（保持方向不变）。"""
+    sp = math.hypot(vx, vy)
+    if sp > vmax > 0:
+        k = vmax / sp
+        return vx * k, vy * k
+    return vx, vy
 
 
 def fmt_duration(seconds):
@@ -4617,6 +4683,16 @@ class PetWindow(QWidget):
         self._drag_blocked = False   # 锁定时按着划了一下（不算点击、也不挪窝）
         self.drag_offset = None
         self.drag_start_pos = None
+        # 拖拽甩出惯性（issue #2）：拖动期间按 (时刻, 屏幕坐标) 采样，
+        # 松手时算末段速度 → 滑出去减速 → 停下再吸附。见 _fling_step()。
+        self.fling_on = bool(self.cfg.get("drag_fling", True))
+        self._drag_samples = []       # [(perf_counter, x, y)]，只留最近一小段
+        self._fling_on = False        # 正在惯性滑行
+        self._fling_vx = 0.0
+        self._fling_vy = 0.0
+        self._fling_fx = 0.0          # 滑行中的浮点位置（避免小速度被取整吃掉）
+        self._fling_fy = 0.0
+        self._fling_t = 0.0           # 已经滑了多久（兜底用）
         self.last_line = ""
         self.last_press_pos = None
 
@@ -6624,9 +6700,94 @@ class PetWindow(QWidget):
             except Exception as exc:
                 print("[anim] 切换形象后同步失败:", exc)
 
+    # ---------- 拖拽甩出惯性（GitHub issue #2）----------
+    def _stop_fling(self):
+        """立刻结束惯性滑行（再按住它 / 收尾吸附之前都要先停）。
+
+        只停速度、不动位置：半空中被抓住就停在半空，接着拖。
+        """
+        self._fling_on = False
+        self._fling_vx = self._fling_vy = 0.0
+        self._fling_t = 0.0
+
+    def _start_fling(self, vx, vy):
+        """松手时给一个初速度。速度不够 / 开关关着 → 返回 False（走老的"松手即吸附"）。"""
+        if not self.fling_on:
+            return False
+        vx, vy = clamp_fling_speed(vx, vy)
+        if math.hypot(vx, vy) < FLING_MIN_SPEED:
+            return False
+        self._fling_on = True
+        self._fling_vx, self._fling_vy = vx, vy
+        self._fling_fx, self._fling_fy = float(self.x()), float(self.y())
+        self._fling_t = 0.0
+        self._fling_need_clip = self.skin == SKIN_ANIM
+        return True
+
+    def _finish_fling(self):
+        """滑完了：现在才吸附 + 转回正面（issue #2 里定的"滑行期间不吸附"）。"""
+        self._stop_fling()
+        self._set_dir("down", 1)
+        self._snap_to_edge()
+        self.rest_until = self.t * self.tick_ms + random.randint(6000, 14000)
+        if getattr(self, "_fling_need_clip", False):
+            # 拖拽期间动作换过的话，窗口宽度被"拖拽闸门"挡住没跟上（见 _anim_clip_changed），
+            # 甩完落地才补这一次重排 —— 滑行中重排会跟惯性抢窗口。
+            self._fling_need_clip = False
+            try:
+                self._anim_clip_changed()
+            except Exception as exc:
+                print("[anim] 甩完补排窗口失败:", exc)
+        self.update()
+
+    def _fling_step(self):
+        """惯性一帧：按速度挪 → 摩擦减速 → 贴边就停那一边，够慢了收尾吸附。
+
+        摩擦是"指数 + 线性"两段：指数那部分决定手感（起步快、尾巴长），
+        线性那部分保证尾巴真能停住 —— 只留指数的话永远差一点点，会一直蹭下去。
+        """
+        dt = self.tick_ms / 1000.0
+        self._fling_t += dt
+        geo = (self.screen() or QApplication.primaryScreen()).availableGeometry()
+        k = math.exp(-FLING_DECAY * dt)
+        self._fling_vx *= k
+        self._fling_vy *= k
+        sp = math.hypot(self._fling_vx, self._fling_vy)
+        if sp > 0:
+            drop = FLING_DRAG * dt
+            if drop >= sp:
+                self._fling_vx = self._fling_vy = 0.0
+            else:
+                self._fling_vx *= (sp - drop) / sp
+                self._fling_vy *= (sp - drop) / sp
+        self._fling_fx += self._fling_vx * dt
+        self._fling_fy += self._fling_vy * dt
+
+        # 夹在屏幕里：撞到哪一边就把那一边的速度清零（沿另一轴继续滑）。
+        # 不做回弹 —— 回弹看着像撞墙，而且会把鱼弹进贴边吸附的死循环。
+        m = self._content_margin()
+        min_x, max_x = geo.left() - m, geo.right() - self.width() + 1 + m
+        min_y, max_y = geo.top(), geo.bottom() - self.height() + 1
+        hit = False
+        if self._fling_fx < min_x:
+            self._fling_fx, self._fling_vx, hit = min_x, 0.0, True
+        elif self._fling_fx > max_x:
+            self._fling_fx, self._fling_vx, hit = max_x, 0.0, True
+        if self._fling_fy < min_y:
+            self._fling_fy, self._fling_vy, hit = min_y, 0.0, True
+        elif self._fling_fy > max_y:
+            self._fling_fy, self._fling_vy, hit = max_y, 0.0, True
+        self.move(int(round(self._fling_fx)), int(round(self._fling_fy)))
+
+        sp = math.hypot(self._fling_vx, self._fling_vy)
+        if (sp < FLING_STOP_SPEED or self._fling_t >= FLING_MAX_SECONDS
+                or (hit and sp < FLING_MIN_SPEED)):
+            self._finish_fling()
+
     # ---------- 吸附 / 翻转 ----------
     def _snap_to_edge(self):
         """松手后按四分之一区域吸附屏幕四边（角落可组合），左吸附时整体水平翻转。"""
+        self._stop_fling()
         if not self.snap_on:
             self.snap_h = self.snap_v = None
             self.flip_x = False
@@ -6676,6 +6837,10 @@ class PetWindow(QWidget):
         # 跟随鼠标时不做吸附（2026-10-25 多屏）：它得跟着光标走，
         # 一吸就被拽回屏幕边 —— 光标到了副屏，它会被一直吸在原屏的边上过不去。
         if self.mode == "follow":
+            return
+        # 正甩出去滑行呢：位置归惯性管，这时候吸附就是"滑到一半被拽到边上"。
+        # 滑完 `_finish_fling()` 会自己调 `_snap_to_edge()`（issue #2：滑完再吸附）。
+        if self._fling_on:
             return
         geo = geo or (self.screen() or QApplication.primaryScreen()).availableGeometry()
         x, y = self.x(), self.y()
@@ -7487,6 +7652,14 @@ class PetWindow(QWidget):
             self.action_t = max(0.0, self.action_t - self._action_decay)
             if self.action_t == 0:
                 self.action = None
+
+        # 甩出去的惯性滑行（issue #2）：滑行期间位置归速度管，散步 / 跟随 / 吸附都别插手。
+        # 放在 `ui_open` / `dragging` 这两个提前返回**之前** —— 不然滑到一半弹个菜单
+        # 或者顺手抓它一下，它就冻在半空不动了。
+        if self._fling_on:
+            self._fling_step()
+            self.update()
+            return
 
         if self.ui_open:        # 菜单 / 对话框开着：站住不动，免得跳上去把设置面板遮住
             if self.perf_mode:
@@ -8804,6 +8977,9 @@ class PetWindow(QWidget):
             self.dragging = False
             self._drag_blocked = False
             self.drag_start_pos = e.globalPosition().toPoint()
+            # 甩出去半路被抓住：就停在半空（位置不跳），接着拖
+            self._stop_fling()
+            self._drag_samples = []     # 这一次拖拽的速度采样（issue #2）
 
     def mouseMoveEvent(self, e):
         if self._forward_mouse_to_menu(e):
@@ -8835,6 +9011,11 @@ class PetWindow(QWidget):
             if self.dragging and self.drag_offset is not None:
                 pos = e.globalPosition().toPoint() - self.drag_offset
                 self.move(pos)
+                # 甩出去的初速度靠这段采样算（issue #2）：记"窗口位置 + 时刻"，
+                # 松手时只取最近 130ms —— 更早的那段手已经拐弯了，会把方向算歪。
+                self._drag_samples.append((time.perf_counter(), pos.x(), pos.y()))
+                if len(self._drag_samples) > 24:
+                    del self._drag_samples[:-24]
                 if abs(delta.x()) > 10:
                     self._set_dir("left" if delta.x() < 0 else "right", 1 if delta.x() < 0 else -1)
                 self.update()
@@ -8859,14 +9040,21 @@ class PetWindow(QWidget):
                 self.dragging = False
                 self.drag_offset = None
                 self.drag_start_pos = None
-                self._set_dir("down", 1)
                 self.target = None
-                self.rest_until = self.t * self.tick_ms + random.randint(6000, 14000)
-                self._snap_to_edge()    # 松手后吸附到最近的边
-                if self.skin == SKIN_ANIM:
+                # 松手按末段速度决定：够快就甩出去（滑行 → 减速 → 停下 → 再吸附），
+                # 不够快还走老规矩"松手即吸附"（issue #2）。
+                vx, vy = fling_velocity(self._drag_samples, time.perf_counter())
+                self._drag_samples = []
+                flying = self._start_fling(vx, vy)
+                if not flying:
+                    self._set_dir("down", 1)
+                    self.rest_until = self.t * self.tick_ms + random.randint(6000, 14000)
+                    self._snap_to_edge()    # 松手后吸附到最近的边
+                if self.skin == SKIN_ANIM and not flying:
                     # 拖拽期间动作换过的话，窗口宽度被"拖拽闸门"挡住没跟上
                     #（_anim_clip_changed 见拖拽就返回）。现在手松了，补一次重排，
                     # 窗口宽度回到当前动作该有的尺寸（围绕新家，200ms 缓动）。
+                    # 甩出去的时候不能现在排 —— 会跟惯性抢窗口，改在 _finish_fling 里补。
                     try:
                         self._anim_clip_changed()
                     except Exception as exc:
@@ -11150,6 +11338,62 @@ class PetWindow(QWidget):
         except (TypeError, ValueError):
             pass
 
+    # ---------- 工作与休息提醒（GitHub issue #3，逻辑在 pet_ext/rest.py）----------
+    def rest_ext(self):
+        """取久坐 / 喝水提醒那个扩展（没加载起来就是 None）。"""
+        return (getattr(self, "ext", {}) or {}).get("rest")
+
+    def rest_option(self, key, default=None):
+        box = self.cfg.get("rest_reminder")
+        if not isinstance(box, dict):
+            box = {}
+        return box.get(key, default)
+
+    def set_rest_option(self, key, value):
+        """改「工作与休息」里的一项（开关 / 分钟数）。
+
+        扩展每 5 秒现读一次配置，所以改完**立刻生效**，不用重启；
+        存盘交给 autosave（每 5 秒一次）—— 滑块拖动时这个函数会被连着调，
+        每次都 save_config 就是连着写盘。
+        """
+        box = dict(self.cfg.get("rest_reminder") or {})
+        box[key] = value
+        self.cfg["rest_reminder"] = box
+        ext = self.rest_ext()
+        if ext is not None:
+            try:
+                ext.on_option_changed(key, value)
+            except Exception as exc:
+                print("[rest] 选项生效失败:", exc)
+
+    def rest_status_text(self):
+        ext = self.rest_ext()
+        if ext is None:
+            return "提醒模块没加载起来（看日志里 [pet_ext] 那行）。"
+        try:
+            return ext.status_text()
+        except Exception:
+            return "状态读不出来（看日志）。"
+
+    def rest_start_break(self, minutes=None):
+        ext = self.rest_ext()
+        if ext is None:
+            return
+        try:
+            ext.start_break(minutes)
+        except Exception as exc:
+            print("[rest] 开始休息失败:", exc)
+
+    def rest_reset(self):
+        ext = self.rest_ext()
+        if ext is None:
+            return
+        try:
+            ext.reset()
+            self.say("好，重新开始计时", seconds=2.4, again=True)
+        except Exception as exc:
+            print("[rest] 重新计时失败:", exc)
+
     def set_perf_mode(self, on):
         """性能模式：动画优先，开设置菜单也不掉帧；休闲模式：省 CPU，可掉一点帧。
 
@@ -11266,6 +11510,15 @@ class PetWindow(QWidget):
             self.snap_h = self.snap_v = None
             self.flip_x = False
         self.update()
+
+    def set_drag_fling(self, on):
+        """拖拽甩出惯性（issue #2）：松手带速度就滑一段再吸附；关掉 = 老的瞬移吸附。"""
+        self.fling_on = bool(on)
+        self.cfg["drag_fling"] = bool(on)
+        if not on:
+            self._stop_fling()
+        self.say("好，甩出去会滑一段再停下" if on else "行，松手就直接贴边",
+                 seconds=2.4, again=True)
 
     def set_flip_on_left(self, on):
         self.flip_on_left = bool(on)
