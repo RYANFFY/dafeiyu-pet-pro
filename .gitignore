@@ -1,5 +1,9 @@
 # 运行时生成
 config.json
+# ⚠️ 配置备份/损坏留证里含 API Key，绝不能进仓库（2026-10-27 第 51 轮补）
+config.bak.json
+config.broken.json
+config.json.tmp
 usage.json
 app_time.json
 lyrics_cache.json
