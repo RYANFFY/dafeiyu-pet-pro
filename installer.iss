@@ -105,8 +105,9 @@ var
   OldUninst: String;
   DoUninstallOld: Boolean;
 
-{ 先声明一下（实现在下面「删目录前的安全闸」那节）：检测时就要用它验目录 }
+{ 先声明一下（实现在下面「删目录前的安全闸」那节）：检测时就要用它们验目录 }
 function LooksLikeOurInstall(const Dir: String): Boolean; forward;
+function NormalizeDir(const Dir: String): String; forward;
 
 { ---------- 找旧版 ---------- }
 
@@ -131,6 +132,10 @@ begin
   { 位置读不到就按默认目录猜（老版本可能没写 InstallLocation） }
   if Dir = '' then
     Dir := ExpandConstant('{localappdata}\Programs\大肥鱼桌宠');
+  { 统一成规范路径（解开 . / ..；UNC 会变成空串） }
+  Dir := NormalizeDir(Dir);
+  if Dir = '' then
+    Exit;
   { ⚠️ 第 53 轮审查：光凭"显示名里有大肥鱼"就信这个路径太危险 ——
     注册表里写歪一个 `D:\` 就会把整个盘当旧版目录。这里再加一道：
     目录里得真有我们的 exe / unins000 / _internal，否则这个键不认。 }
@@ -292,12 +297,25 @@ begin
   end;
 end;
 
-{ 路径规范化：去首尾空白、去掉结尾多余的 `\`（C:\a\ 和 C:\a 当成同一个） }
+{ 路径规范化：去首尾空白 → **解析成规范的绝对路径**（把 `.` `..` 都解开）→ 去掉结尾多余的 `\`。
+  ⚠️ 第 56 轮审查：原来只去空格和结尾反斜杠，`D:\大肥鱼桌宠\..\..\Windows` 这种带跳转的
+  路径能绕过后面的"盘根 / 系统目录"检查，然后被递归删掉。必须先解析再判、再删。
+  UNC 共享路径（\\server\share）一律返回空串 —— 那种东西不归我们管，绝不删。 }
 function NormalizeDir(const Dir: String): String;
 var
   D: String;
 begin
+  Result := '';
   D := Trim(Dir);
+  if D = '' then
+    Exit;
+  try
+    D := ExpandFileName(D);          { 相对 → 绝对，`.` 和 `..` 一并解开 }
+  except
+    Exit;
+  end;
+  if (Length(D) >= 2) and (Copy(D, 1, 2) = '\\') then
+    Exit;                            { UNC：\\server\share，直接不认 }
   while (Length(D) > 3) and (D[Length(D)] = '\') do
     Delete(D, Length(D), 1);
   Result := D;
@@ -344,7 +362,9 @@ var
   D: String;
 begin
   Result := False;
-  D := RemoveBackslashUnlessRoot(Trim(Dir));
+  D := NormalizeDir(Dir);                     { 已解析 . / .. ，UNC 会变成空串 }
+  if D = '' then
+    Exit;
   if Length(D) < 4 then                       { C:\x 最少 4 个字符 }
     Exit;
   if (Length(D) = 3) and (D[2] = ':') then    { D:\ 这种盘根 }

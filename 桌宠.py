@@ -4565,7 +4565,7 @@ class PetWindow(QWidget):
         self.skin = self.cfg.get("skin", SKIN_PET)
         if self.skin == SKIN_ANIM:
             # 灵动版靠 sprites_anim/ 里的帧序列，素材不在就先按三视图显示
-            if not os.path.isdir(os.path.join(APP_DIR, "sprites_anim")):
+            if not os.path.isdir(os.path.join(BUNDLE_DIR, "sprites_anim")):
                 self.skin = SKIN_PET
         elif self.skin not in (SKIN_PET, SKIN_WIDGET) or (
                 self.skin == SKIN_WIDGET and not self._has_sprite("挂件")):
@@ -9264,7 +9264,7 @@ class PetWindow(QWidget):
         a.setChecked(self.skin == SKIN_WIDGET)
         a.triggered.connect(lambda _, n=SKIN_WIDGET: self.set_skin(n))
         # 第三种：灵动版（视频拆帧，真的会做动作）。素材不在时这一项不出现
-        if os.path.isdir(os.path.join(APP_DIR, "sprites_anim")):
+        if os.path.isdir(os.path.join(BUNDLE_DIR, "sprites_anim")):
             a = skin_menu.addAction(f"{SKIN_ANIM}（带动作）")
             a.setCheckable(True)
             a.setChecked(self.skin == SKIN_ANIM)
@@ -9551,7 +9551,7 @@ class PetWindow(QWidget):
             "SKIN_PET": SKIN_PET,
             "SKIN_WIDGET": SKIN_WIDGET,
             # 灵动版：素材不在就传空串，设置页按"有没有值"决定要不要显示第三档
-            "SKIN_ANIM": (SKIN_ANIM if os.path.isdir(os.path.join(APP_DIR, "sprites_anim"))
+            "SKIN_ANIM": (SKIN_ANIM if os.path.isdir(os.path.join(BUNDLE_DIR, "sprites_anim"))
                           else ""),
             "LAYER_LABELS": dict(self.LAYER_LABELS),
             "currency_symbol": currency_symbol,
