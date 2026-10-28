@@ -120,6 +120,15 @@ subprocess.Popen([comspec, "/c", f'ping -n 3 127.0.0.1 >nul & start "" "{exe}"']
 - [x] 全套 **24 个脚本 436 个 ✓** 全绿
 - [ ] 主人复验：跟随 + 屏幕边缘做动作，不该再往下弹
 
+### 已发版（2026-10-28 04:14）
+
+- [x] 推送 `main`：`38389c6 → e94131d`（5 个提交）→ 徽章那次 `82bcd96`
+- [x] tag `v1.1.8` 已推（指向 `e94131d`）
+- [x] GitHub Release v1.1.8 已发：资产 `dafeiyu-pet-setup.exe` = 269,256,240 字节
+      （`releases/latest` 已指向 v1.1.8，下载数从 0 起）
+- [x] 隐私复查：`config.json` / `config.bak.json` / `*.log` 都不在跟踪列表里；
+      5 个提交的 diff 里没有 `sk-` / `gho_` / api_key 之类
+
 ### 自检 / 产物
 
 - [x] `手动测试.bat` → 6：**24 个脚本全绿**（429 个 ✓，EXIT=0，含新增的 `test_wander_action.py`）
