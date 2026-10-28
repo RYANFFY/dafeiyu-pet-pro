@@ -38,6 +38,12 @@ installer itself can be deleted afterwards.
   The walk engine used to cut in with `crab_in` one frame after an action started (so the action
   never actually played), and when it finished it fought with the wander target over direction.
   The walk engine now yields while a one-shot action plays, and resumes right after it ends.
+- **Fixed: in follow-cursor mode, the whole action played while sliding toward the cursor.**
+  The pet now stands still while an action plays (no target changes, no window movement) and
+  resumes following once the action ends.
+- **Fixed: after an action in free-wander mode, the pet didn't walk back.** If it stepped aside
+  just so the action would fit, it now walks back to where it started and carries on wandering
+  (follow mode doesn't walk back — it should follow the cursor anyway).
 
 ## 🆕 What's new in v1.1.7
 

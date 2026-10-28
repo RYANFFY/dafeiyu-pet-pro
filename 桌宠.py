@@ -7869,6 +7869,17 @@ class PetWindow(QWidget):
         # 这一趟"去那儿做动作"在走的话，除了散步/跟随，谁也别改 target
         has_task = getattr(self, "_walk_task", None) is not None
 
+        # ⭐ 正在做一次性动作：**位置也站住**（主人 2026-10-28：「跟随鼠标下右键让她做动作，
+        # 整个动作直接开始跟着鼠标平移做的」）。
+        # 上一步只挡了"散步走路抢动画"，没挡"散步/跟随还在改 target 并挪窗口"——
+        # 跟随模式每帧都按光标重设 target，于是动作一边播一边滑过去。
+        # 动作播完 `_anim_after_once()` 会把标记摘掉，这里自然恢复。
+        if self._anim_once_now():
+            self.target = None
+            self.cur_speed = 0.0
+            self.update()
+            return
+
         if self.mode == "follow" and not has_task:
             if self._console_open():
                 # 设置窗口开着：站着别跟着鼠标跑（挡住设置就没法点了）
@@ -8796,6 +8807,16 @@ class PetWindow(QWidget):
             _pl = getattr(getattr(self, "ext", {}).get("anim"), "player", None)
             if rng and _pl is not None:
                 _pl.play_range("idle", rng[0], rng[1], loop=True)
+            return
+        # 散步：刚才是为了放下动作才走出去的 → 做完**走回出发位置**再继续散步
+        # （主人 2026-10-28：「自由散步……也没有自己重新回去」）。
+        # 跟随不掺和：它本来就该跟着光标走，走回旧位置反而是错的。
+        back = getattr(self, "_return_cx", None)
+        self._return_cx = None
+        if back is not None and self.mode == "wander" and abs(
+                back - (self.x() + self.width() / 2)) > WALK_GAP:
+            self.target = (back, self.y() + self.height() / 2)
+            self._amb_walk_start()
             return
         _anim = getattr(self, "ext", {}).get("anim")
         if _anim is None:
@@ -11327,6 +11348,7 @@ class PetWindow(QWidget):
         self.mode = mode
         self.target = None
         self.cfg["mode"] = mode
+        self._return_cx = None       # 换模式就别惦记"走回出发位置"了
         if mode != "still":
             self._clear_still_side()     # 原地待着的"转头"状态带不走
             # 吸附只在「原地待着」有意义（见 `_settle` / `_snap_to_edge` 里的
@@ -12229,6 +12251,11 @@ class PetWindow(QWidget):
         # 走之前把"家"存一份：走路时窗口比待机宽，贴边时中心会被屏幕夹住，
         # 路上也可能把 _anim_home 蹭偏一点；做完动作要精确回原位就靠这一份（实测差过 10px）。
         self._walk_home = self._anim_home if still else None
+        # 散步模式：这趟是**为了让动作放得下才走出去的**，做完得走回来
+        # （主人 2026-10-28：「自由散步……也没有自己重新回去」）。
+        # 原地待着走的是 `_walk_home` 那条老路，这里只给散步记出发位置，
+        # 动作播完由 `_anim_after_once()` 把 target 指回去。
+        self._return_cx = None if still else cur_cx
         self._walk_dest = (dest_cx, self.y() + self.height() / 2.0)
         self._walk_flip = dest_cx > cur_cx        # 素材朝左走，往右要镜像
         self._walk_phase = "in" if crab else "walk"
@@ -12361,10 +12388,14 @@ class PetWindow(QWidget):
         return False
 
     def _anim_once_now(self):
-        """灵动版现在正在播一次性动作吗？（带 8 秒保险：回调万一丢了，别把鱼永久冻住）"""
+        """灵动版现在正在播一次性动作吗？（带保险：回调万一丢了，别把鱼永久冻住）
+
+        保险给 **15 秒**：最长的一段动作是 241 帧 ≈ 10 秒，留够余量 ——
+        之前写 8 秒，10 秒的动作播到第 8 秒保险就过期了，鱼会在最后两秒开始挪。
+        """
         if not getattr(self, "_anim_once_busy", False):
             return False
-        if time.perf_counter() - getattr(self, "_anim_once_t0", 0.0) > 8.0:
+        if time.perf_counter() - getattr(self, "_anim_once_t0", 0.0) > 15.0:
             self._anim_once_busy = False
             return False
         return True
@@ -12469,6 +12500,7 @@ class PetWindow(QWidget):
         self._walk_phase = None
         self._walk_flip = False
         self._walk_home = None          # 用户插手了：以他放下的位置为家，别弹回去
+        self._return_cx = None          # 也不许"做完走回出发位置"了（人都被挪走了）
         self.target = None
         self.cur_speed = 0.0
         self._stuck_ticks = 0
