@@ -1,6 +1,6 @@
 ; 大肥鱼桌宠 · Windows 安装包脚本（Inno Setup 6）
-; 编译：ISCC.exe /DMyAppVersion=1.1.8 installer.iss
-; 产物：dist\大肥鱼桌宠-安装版-v1.1.8.exe
+; 编译：ISCC.exe /DMyAppVersion=1.1.9 installer.iss
+; 产物：dist\大肥鱼桌宠-安装版-v1.1.9.exe
 ;
 ; 2026-10-27 加：**检测旧版 → 问要不要先卸载 → 卸完装回原目录**。
 ; 主人的要求：「如果用户电脑上有旧版的桌宠，双击安装包后会给用户删除旧桌宠的选项，

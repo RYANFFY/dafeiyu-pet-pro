@@ -54,7 +54,8 @@ except Exception:
 # 注意：**没推送就不算开新版本** —— 同一版里的返工都算在同一个号上（2026-09-14 主人定的）。
 # 2026-10-27 主人让从 1.1.5 提到 1.1.6（第 41~51 轮这一大批改动）。
 # 2026-10-28 第 60 轮：打包版「重启桌宠」按钮真机炸了（cmd 命令拼错），修完提 1.1.8。
-APP_VERSION = "1.1.8"
+# 2026-10-28 第 61 轮：销售版（关于页去掉「项目主页 / 反馈提需求」两个按钮）→ 1.1.9。
+APP_VERSION = "1.1.9"
 
 # 最小化动画时长（毫秒）：照着 Windows 那套"往任务栏收"的感觉来
 MINIMIZE_ANIM_MS = 190
@@ -79,6 +80,8 @@ SHELL_RADIUS = 14
 # 所以同一段 190ms 我们按 8ms 走 —— 时间不变、帧数翻倍。
 ANIM_TICK_MS = 8
 
+# 仓库地址。2026-10-28 销售版起，**界面上不再露出它**（关于页那两个按钮已删）；
+# 留着这个常量是给以后"换成店铺 / 联系方式"用的，别再往界面里塞仓库链接。
 GITHUB_URL = "https://github.com/RYANFFY/deepseek-dafeiyu-pet"
 
 
@@ -4486,11 +4489,9 @@ class ConsoleWindow(QWidget):
         card.addLayout(head)
         page.hint(card, "显示 DeepSeek 余额、天气、正在放的歌与歌词；"
                         "能换形象、带音效、可开机自启。")
-        page.buttons(card, [
-            ("项目主页", lambda: self._open_url(GITHUB_URL), "primary", "ui.external"),
-            ("反馈 / 提需求",
-             lambda: self._open_url(GITHUB_URL + "/issues"), None, "ui.help"),
-        ], align_right=False)
+        # 2026-10-28 销售版：**关于页不放「项目主页 / 反馈提需求」两个按钮**了
+        # （主人要卖的版本，不想把买家往仓库里引）。仓库本身仍是公开的（闲鱼文案里写了 MIT），
+        # 只是界面上不再主动露出。要换成店铺 / 联系方式时，直接在这里加一行 buttons 即可。
 
     # ---------------- 小工具 ----------------
     def _size_pct(self, mult):
