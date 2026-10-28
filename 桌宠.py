@@ -12248,6 +12248,16 @@ class PetWindow(QWidget):
             wy = max(geo.top(), min(geo.bottom() - wh + 1, wy))
         self._anim_walking = True
         self._walk_task = (clip, loop)
+        # 这一趟**只横着走**：y 冻在这一刻（2026-10-28 主人报的「边缘做动作会向下闪现」）。
+        # 以前 `_walk_dest` 用起点的 y、`_walk_after_once` 又用"转身结束那一刻"的 y，
+        # 中间只要被跟随/散步的旧目标拽着往下挪过一点，这两个 y 就对不上 ——
+        # 到位后按"家"摆窗口时会"咔"一下往下瞬移，距离正好等于被拽下去的那一段。
+        self._walk_bottom = self.y() + self.height()
+        # 转身那 0.6 秒里**别让旧的跟随/散步目标继续拽着走**：
+        # 以前 target 没清，`_walk_phase == "in"` 时照样按旧目标挪窗口
+        # （主人描述的"顶着屏幕边缘向下走动一段"就是它）。
+        self.target = None
+        self.cur_speed = 0.0
         # 走之前把"家"存一份：走路时窗口比待机宽，贴边时中心会被屏幕夹住，
         # 路上也可能把 _anim_home 蹭偏一点；做完动作要精确回原位就靠这一份（实测差过 10px）。
         self._walk_home = self._anim_home if still else None
@@ -12256,7 +12266,7 @@ class PetWindow(QWidget):
         # 原地待着走的是 `_walk_home` 那条老路，这里只给散步记出发位置，
         # 动作播完由 `_anim_after_once()` 把 target 指回去。
         self._return_cx = None if still else cur_cx
-        self._walk_dest = (dest_cx, self.y() + self.height() / 2.0)
+        self._walk_dest = (dest_cx, self._walk_bottom - wh / 2.0)
         self._walk_flip = dest_cx > cur_cx        # 素材朝左走，往右要镜像
         self._walk_phase = "in" if crab else "walk"
         try:
@@ -12300,7 +12310,13 @@ class PetWindow(QWidget):
             pl.play(CRAB_LOOP, loop=True, restart=True)
             if getattr(self, "mode", "still") != "still":
                 # 散步/跟随：家在脚底下，落点就是新家（不搬的话到位会按旧家摆窗口）
-                self._anim_home = (self._walk_dest[0], self.y() + self.height())
+                # ⚠️ 底边必须用**出发时冻住的那一份**（`_walk_bottom`），不能重读 `self.y()`：
+                # 转身那段如果被旧目标拽下去过，重读就会把"家"记在半路上，
+                # 到位后按家摆窗口 = 往下瞬移（2026-10-28 主人报的「向下闪现」）。
+                self._anim_home = (self._walk_dest[0],
+                                   getattr(self, "_walk_bottom", None)
+                                   if getattr(self, "_walk_bottom", None) is not None
+                                   else self.y() + self.height())
             self.target = self._walk_dest
             self._stuck_ticks = 0
             self.cur_speed = 0.0
@@ -12446,6 +12462,7 @@ class PetWindow(QWidget):
         self._walk_phase = None
         self._walk_flip = False
         self._walk_home = None
+        self._walk_bottom = None        # 这一趟的纵向基准用完了，清掉
         if not getattr(self, "_anim_walking", False):
             return
         self._anim_walking = False
@@ -12500,6 +12517,7 @@ class PetWindow(QWidget):
         self._walk_phase = None
         self._walk_flip = False
         self._walk_home = None          # 用户插手了：以他放下的位置为家，别弹回去
+        self._walk_bottom = None
         self._return_cx = None          # 也不许"做完走回出发位置"了（人都被挪走了）
         self.target = None
         self.cur_speed = 0.0

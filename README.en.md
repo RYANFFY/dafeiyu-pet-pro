@@ -44,6 +44,11 @@ installer itself can be deleted afterwards.
 - **Fixed: after an action in free-wander mode, the pet didn't walk back.** If it stepped aside
   just so the action would fit, it now walks back to where it started and carries on wandering
   (follow mode doesn't walk back — it should follow the cursor anyway).
+- **Fixed: follow-cursor + screen edge = the pet "flashed" downwards.** It used to keep running
+  down along the edge during the turn-in-place phase (the old follow target was still dragging it),
+  then snap down by exactly that distance once the action started. Now the turn phase really doesn't
+  move the window, and the vertical position is frozen at the moment the trip starts — it only
+  walks horizontally.
 
 ## 🆕 What's new in v1.1.7
 
