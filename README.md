@@ -9,7 +9,7 @@ English | [中文](README.md) → [README.en.md](README.en.md)
 
 ## ⬇️ 下载即用（Windows）
 
-[![最新版本](https://img.shields.io/github/v/release/RYANFFY/deepseek-dafeiyu-pet?label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC&v=3&cacheSeconds=300)](https://github.com/RYANFFY/deepseek-dafeiyu-pet/releases/latest)
+[![最新版本](https://img.shields.io/github/v/release/RYANFFY/deepseek-dafeiyu-pet?label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC&v=4&cacheSeconds=300)](https://github.com/RYANFFY/deepseek-dafeiyu-pet/releases/latest)
 [![下载量](https://img.shields.io/github/downloads/RYANFFY/deepseek-dafeiyu-pet/total?label=%E4%B8%8B%E8%BD%BD%E9%87%8F&v=3&cacheSeconds=300)](https://github.com/RYANFFY/deepseek-dafeiyu-pet/releases)
 
 ### 👉 [**点这里下载最新版（Windows 安装版）**](https://github.com/RYANFFY/deepseek-dafeiyu-pet/releases/latest/download/dafeiyu-pet-setup.exe)
