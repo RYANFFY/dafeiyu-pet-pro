@@ -7900,7 +7900,10 @@ class PetWindow(QWidget):
                         else:
                             self._amb_phase = None
         elif self.mode == "wander":
-            if self.target is None:
+            # 正在做动作（点名动作 / 走过去之后那个动作）：别急着挑下一个落脚点。
+            # 不然动作刚起，`target` 就被随机填上 → 一边做动作一边被拽着走，
+            # 做完那一刻两套逻辑抢方向（主人 2026-10-28 报的 A4）。
+            if self.target is None and not self._anim_once_now():
                 if now_ms < self.rest_until:
                     self._maybe_idle_action()
                     self.update()
@@ -8779,6 +8782,8 @@ class PetWindow(QWidget):
         开头先问一句 `_walk_after_once`：走位的"转身 → 走 → 转回正面"三段就是靠
         这里接力的（每段都是 loop=False，播完就会进来）。
         """
+        # 动作做完了：把「正在做动作」的标记摘掉，散步/跟随可以重新接管
+        self._anim_once_busy = False
         if self._walk_after_once(clip):
             return
         if self._amb_after_once(clip):
@@ -12041,6 +12046,18 @@ class PetWindow(QWidget):
 
         # 垂直补偿渐变：大口吃零食比别的段低 16px，切过去别硬跳
         pl = self.ext["anim"].player
+        # ⭐「正在做动作」标记（2026-10-28，主人报的 A4）：
+        # 一次性动作播着的时候，散步/跟随那套走路**不许**再来抢 —— 不然它会把刚播起来的
+        # 动作顶掉（实测：自由散步下点「玩水枪」，下一帧就被 crab_in 盖了，动作压根没出来），
+        # 做完那一刻又会被散步随机出的目标拽着跑，两套逻辑互相拉扯。
+        # 转身两段（crab_in / crab_out）本身就是 loop=False，得排掉，不然走路自己把自己锁死。
+        self._anim_once_busy = (not getattr(pl, "loop", True)) and pl.clip not in (CRAB_IN, CRAB_OUT)
+        self._anim_once_t0 = time.perf_counter()
+        if self._anim_once_busy:
+            # 做动作期间先把散步/跟随那趟收摊：别一边做动作一边走，也别等会儿再抢
+            self._amb_phase = None
+            self.target = None
+            self.cur_speed = 0.0
         self._anim_dy_from = self._anim_dy_now()
         self._anim_dy_to = pl.clip_dy() if hasattr(pl, "clip_dy") else 0
         self._anim_dy_t0 = time.perf_counter()
@@ -12343,6 +12360,15 @@ class PetWindow(QWidget):
             return True
         return False
 
+    def _anim_once_now(self):
+        """灵动版现在正在播一次性动作吗？（带 8 秒保险：回调万一丢了，别把鱼永久冻住）"""
+        if not getattr(self, "_anim_once_busy", False):
+            return False
+        if time.perf_counter() - getattr(self, "_anim_once_t0", 0.0) > 8.0:
+            self._anim_once_busy = False
+            return False
+        return True
+
     def _amb_sync_walk(self, dx):
         """每走一步都对一次：散步/跟随要走路就起「螃蟹走路」，方向按 dx 镜像。"""
         if self.skin != SKIN_ANIM:
@@ -12350,6 +12376,10 @@ class PetWindow(QWidget):
         if getattr(self, "_walk_task", None) is not None:
             return                       # "去那儿做动作"那趟自己管，别插手
         if self.mode not in ("wander", "follow"):
+            return
+        # 正在做动作：**别用散步走路把动作顶掉**（2026-10-28 主人报的 A4：
+        # 自由散步下点宽动作，crab_in 下一帧就盖上去，动作根本没做出来）
+        if self._anim_once_now():
             return
         if getattr(self, "dragging", False) or self.target is None:
             return

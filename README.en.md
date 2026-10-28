@@ -34,6 +34,10 @@ installer itself can be deleted afterwards.
   It used to force "snap to screen edges" on every time you came back from follow-cursor / wander,
   regardless of your setting. Now it simply remembers what you set: off stays off, on stays on
   (while in follow / wander it still shows as off and can't be clicked).
+- **Fixed: in free-wander mode, playing an action got overridden by the walking animation.**
+  The walk engine used to cut in with `crab_in` one frame after an action started (so the action
+  never actually played), and when it finished it fought with the wander target over direction.
+  The walk engine now yields while a one-shot action plays, and resumes right after it ends.
 
 ## 🆕 What's new in v1.1.7
 
